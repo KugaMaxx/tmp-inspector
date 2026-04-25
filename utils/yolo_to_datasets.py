@@ -12,12 +12,8 @@ from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_det_dataset
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Convert YOLO annotations into a huggingface dataset."
-        )
-    )
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert YOLO annotations into a huggingface dataset.")
     parser.add_argument(
         "--input_path",
         type=str,
@@ -36,7 +32,11 @@ def main():
         default=512,
         help="Image size used by YOLODataset preprocessing.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+def main():
+    # Parse arguments
+    args = parse_args()
 
     # Load dataset info from YOLODataset
     print(f"Loading dataset from: {args.input_path}")

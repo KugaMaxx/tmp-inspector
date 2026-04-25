@@ -22,6 +22,109 @@ except ImportError:
     SummaryWriter = None
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a GPT-2 model to generate bounding box priors from text prompts.")
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default='gpt2-fire',
+        help="Directory to save model and logs"
+    )
+
+    # Dataset
+    parser.add_argument(
+        "--dataset_name_or_path",
+        type=str,
+        required=True,
+        help="Name or path of the dataset (HuggingFace dataset name or local path)"
+    )
+    parser.add_argument(
+        "--block_size",
+        type=int,
+        default=256,
+        help="Size of text blocks for training sequences"
+    )
+
+    # Training
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=32,
+        help="Batch size per device during training"
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=5e-5,
+        help="Initial learning rate for training"
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=100,
+        help="Total number of training epochs"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use FP16 mixed precision training"
+    )
+
+    # Logging
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=1000,
+        help="Save checkpoint every X update steps"
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=1,
+        help="Maximum number of checkpoints to keep"
+    )
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=100,
+        help="Log training metrics every X steps"
+    )
+
+    # Validation
+    parser.add_argument(
+        "--validation_prompts",
+        nargs="+",
+        default=[],
+        help="Prompts for text generation during training"
+    )
+    parser.add_argument(
+        "--validation_interval",
+        type=int,
+        default=500,
+        help="Generate text samples every X steps"
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help="Comma separated tracking backends: none, tensorboard, wandb"
+    )
+    
+    return parser.parse_args()
+
+
 class ValidationCallback(TrainerCallback):
     def __init__(self, tokenizer, prompts, interval, report_to, output_dir):
         self.tokenizer = tokenizer
@@ -227,109 +330,9 @@ def preprocess(examples, tokenizer, block_size):
 def main():
     # Set TOKENIZERS_PARALLELISM to suppress huggingface tokenizers warning
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    parser = argparse.ArgumentParser(description="Train a GPT-2 model to generate bounding box priors from text prompts.")
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default="openai-community/gpt2",
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./outputs/tmp-gpt2-fire-w-val",
-        help="Directory to save model and logs"
-    )
 
-    # Dataset
-    parser.add_argument(
-        "--dataset_name_or_path",
-        type=str,
-        default="/home/23132798r/workspace/tmp-inspector/data/tmp-fire",
-        help="Name or path of the dataset (HuggingFace dataset name or local path)"
-    )
-    parser.add_argument(
-        "--block_size",
-        type=int,
-        default=256,
-        help="Size of text blocks for training sequences"
-    )
-
-    # Training
-    parser.add_argument(
-        "--per_device_train_batch_size",
-        type=int,
-        default=32,
-        help="Batch size per device during training"
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=5e-5,
-        help="Initial learning rate for training"
-    )
-    parser.add_argument(
-        "--num_train_epochs",
-        type=int,
-        default=200,
-        help="Total number of training epochs"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility"
-    )
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Use FP16 mixed precision training"
-    )
-
-    # Logging
-    parser.add_argument(
-        "--save_steps",
-        type=int,
-        default=1000,
-        help="Save checkpoint every X update steps"
-    )
-    parser.add_argument(
-        "--save_total_limit",
-        type=int,
-        default=1,
-        help="Maximum number of checkpoints to keep"
-    )
-    parser.add_argument(
-        "--logging_steps",
-        type=int,
-        default=100,
-        help="Log training metrics every X steps"
-    )
-
-    # Validation
-    parser.add_argument(
-        "--validation_prompts",
-        nargs="+",
-        default=[
-            "[large, fire exit sign], [large, fire hose reel], [medium, fire alarm] ;",
-            "[large, fire extinguisher], [medium, fire exit sign] ;"
-        ],
-        help="Prompts for text generation during training"
-    )
-    parser.add_argument(
-        "--validation_interval",
-        type=int,
-        default=100,
-        help="Generate text samples every X steps"
-    )
-    parser.add_argument(
-        "--report_to",
-        type=str,
-        default="tensorboard",
-        help="Comma separated tracking backends: none, tensorboard, wandb"
-    )
-    args = parser.parse_args()
+    # Parse arguments
+    args = parse_args()
 
     report_to = [r.strip() for r in args.report_to.split(",") if r.strip()]
     if len(report_to) == 0 or report_to == ["none"]:
