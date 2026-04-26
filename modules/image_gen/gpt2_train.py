@@ -20,6 +20,11 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
+    
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 def parse_args():
@@ -133,30 +138,34 @@ class ValidationCallback(TrainerCallback):
         self.report_to = report_to
         self.output_dir = output_dir
         self.tb_writer = None
+        self.img_sz = 512
 
     @staticmethod
-    def _extract_labels_from_prompt(prompt):
-        prompt_part = prompt.split(";", 1)[0]
-        labels = []
-        for item in re.findall(r"\[(.*?)\]", prompt_part):
-            parts = [p.strip() for p in item.split(",", 1)]
-            if len(parts) == 2:
-                labels.append(parts[1])
-        return labels
-
-    @staticmethod
-    def _parse_bbox_response(decoded_text):
+    def _parse_string(decoded_text):
         if ";" not in decoded_text:
             return None
 
-        response_part = decoded_text.split(";", 1)[1]
-        raw_boxes = re.findall(r"\[(.*?)\]", response_part)
-        if len(raw_boxes) == 0:
+        # extract prompt and response parts
+        prompt, response = decoded_text.split(";", 1)
+        response = response.split(";", 1)[0]
+
+        # extract info
+        labels = re.findall(r"\[(.*?)\]", prompt)
+        bboxes = re.findall(r"\[(.*?)\]", response)
+
+        # check if counts match and are non-empty
+        if len(labels) == 0 or len(bboxes) == 0 or len(labels) > len(bboxes):
             return None
 
-        bboxes = []
-        for raw in raw_boxes:
-            vals = [v.strip() for v in raw.split(",")]
+        # only consider up to the number of labels
+        n = len(labels)
+
+        # parse bbox coordinates
+        parsed_results = []
+        for label, bbox in zip(labels[:n], bboxes[:n]):
+            vals = [v.strip() for v in bbox.split(",")]
+
+            # Expecting exactly 4 values: x, y, w, h
             if len(vals) != 4:
                 return None
             try:
@@ -167,45 +176,19 @@ class ValidationCallback(TrainerCallback):
             # Strict [x, y, w, h] normalized format
             if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
                 return None
-            bboxes.append([x, y, w, h])
 
-        return bboxes
+            # append valid bbox
+            parsed_results.append([label, [x, y, w, h]])
 
-    @staticmethod
-    def _default_bw_image(size=512):
-        img = Image.new("RGB", (size, size), "black")
-        draw = ImageDraw.Draw(img)
-        draw.line((0, 0, size - 1, size - 1), fill="white", width=2)
-        draw.line((0, size - 1, size - 1, 0), fill="white", width=2)
-        return img
-
-    @staticmethod
-    def _render_bboxes(prompt, bboxes, size=512):
-        labels = ValidationCallback._extract_labels_from_prompt(prompt)
-        n = min(len(labels), len(bboxes))
-
-        img = Image.new("RGB", (size, size), "black")
-        draw = ImageDraw.Draw(img)
-        for label, (x, y, w, h) in zip(labels[:n], bboxes[:n]):
-            x1 = int(x * size)
-            y1 = int(y * size)
-            x2 = x1 + int(w * size)
-            y2 = y1 + int(h * size)
-
-            x1 = max(0, min(size - 1, x1))
-            y1 = max(0, min(size - 1, y1))
-            x2 = max(0, min(size - 1, x2))
-            y2 = max(0, min(size - 1, y2))
-
-            draw.rectangle([(x1, y1), (x2, y2)], outline="white", width=2)
-            draw.text((x1, max(0, y1 - 12)), label, fill="white")
-
-        return img
+        return parsed_results
 
     def _log_images(self, images, state):
         if "tensorboard" in self.report_to and SummaryWriter is not None:
+            # Initialize SummaryWriter if not already done
             if self.tb_writer is None:
                 self.tb_writer = SummaryWriter(log_dir=os.path.join(self.output_dir, "validation_images"))
+
+            # Log each image with a unique tag
             for i, img in enumerate(images):
                 self.tb_writer.add_image(
                     tag=f"validation/prompt_{i}",
@@ -213,22 +196,15 @@ class ValidationCallback(TrainerCallback):
                     global_step=state.global_step,
                     dataformats="HWC",
                 )
-                img.save(f'{i}.png')
                 
             self.tb_writer.flush()
 
-        if "wandb" in self.report_to:
-            try:
-                wandb_module = importlib.import_module("wandb")
-            except ImportError:
-                wandb_module = None
-
-            if wandb_module is not None and wandb_module.run is not None:
-                payload = {
-                    f"validation/prompt_{i}": wandb_module.Image(img, caption=f"step={state.global_step}, prompt_id={i}")
-                    for i, img in enumerate(images)
-                }
-                wandb_module.log(payload, step=state.global_step)
+        if "wandb" in self.report_to and wandb is not None:
+            payload = {
+                f"validation/prompt_{i}": wandb.Image(img, caption=f"step={state.global_step}, prompt_id={i}")
+                for i, img in enumerate(images)
+            }
+            wandb.log(payload, step=state.global_step)
 
     def on_step_end(self, args, state, control, **kwargs):
         if self.interval <= 0:
@@ -236,13 +212,13 @@ class ValidationCallback(TrainerCallback):
         if state.global_step == 0 or state.global_step % self.interval != 0:
             return control
 
+        # Initialize model and device
         model = kwargs.get("model")
-        if model is None:
-            return control
-
-        device = next(model.parameters()).device
         model.eval()
-        decoded_results = []
+        device = next(model.parameters()).device
+        
+        # Generate text for each prompt and decode
+        parsed_results = []
         with torch.no_grad():
             for prompt in self.prompts:
                 inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
@@ -255,31 +231,46 @@ class ValidationCallback(TrainerCallback):
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
-                text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                decoded_results.append((prompt, text))
-                print(f"\n[step {state.global_step}] prompt: {prompt}\n{text}\n")
+                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # Special case 1: if any generated response after ';' is invalid, all prompts use default B/W image.
-        invalid_exists = False
-        parsed_bboxes = []
-        for _, text in decoded_results:
-            bboxes = self._parse_bbox_response(text)
-            if bboxes is None:
-                invalid_exists = True
-            parsed_bboxes.append(bboxes)
+                # Log the prompt and response for debugging
+                print(f"\n[prompt]: {prompt}\n [response]: {response}\n")
+                
+                # Attempt to parse the response and log the results
+                parsed_results.append(self._parse_string(response))
 
-        if invalid_exists:
-            images = [self._default_bw_image(512) for _ in self.prompts]
-        else:
-            # Special case 2: if bbox count and prompt-object count mismatch,
-            # only render min(prompt_count, bbox_count) in order.
-            images = [
-                self._render_bboxes(prompt, bboxes, size=512)
-                for (prompt, _), bboxes in zip(decoded_results, parsed_bboxes)
-            ]
+        images = []
+        for result in parsed_results:
+            # Create a blank image
+            img = Image.new("RGB", (self.img_sz, self.img_sz), "black")
+            draw = ImageDraw.Draw(img)
+
+            # If parsing failed, log a default image indicating invalid output
+            if result is None:
+                draw.text((10, 10), "Invalid output", fill="white")
+
+            # If parsing succeeded, render the bounding boxes on an image
+            else:
+                for label, (x, y, w, h) in result:
+                    x1 = int((x - w / 2.0) * self.img_sz)
+                    y1 = int((y - h / 2.0) * self.img_sz)
+                    x2 = int((x + w / 2.0) * self.img_sz)
+                    y2 = int((y + h / 2.0) * self.img_sz)
+
+                    x1 = max(0, min(self.img_sz - 1, x1))
+                    y1 = max(0, min(self.img_sz - 1, y1))
+                    x2 = max(0, min(self.img_sz - 1, x2))
+                    y2 = max(0, min(self.img_sz - 1, y2))
+
+                    draw.rectangle([(x1, y1), (x2, y2)], outline="white", width=2)
+                    draw.text((x1, max(0, y1 - 12)), label, fill="white")
+            
+            # Update
+            images.append(img)
 
         self._log_images(images, state)
         model.train()
+
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -307,7 +298,7 @@ def preprocess(examples, tokenizer, block_size):
         ]
 
         # Join them together and append the EOS token
-        text = " , ".join(prompt) + " ; " + " , ".join(response) + tokenizer.eos_token
+        text = " , ".join(prompt) + " ; " + " , ".join(response) + " ; "
         texts.append(text)
 
     # Tokenize texts
@@ -334,9 +325,9 @@ def main():
     # Parse arguments
     args = parse_args()
 
-    report_to = [r.strip() for r in args.report_to.split(",") if r.strip()]
-    if len(report_to) == 0 or report_to == ["none"]:
-        report_to = "none"
+    args.report_to = [r.strip() for r in args.report_to.split(",") if r.strip()]
+    if len(args.report_to) == 0 or args.report_to == ["none"]:
+        args.report_to = "none"
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path)
@@ -364,7 +355,6 @@ def main():
     # Training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        overwrite_output_dir=True,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
         learning_rate=args.learning_rate,
@@ -372,7 +362,7 @@ def main():
         save_total_limit=args.save_total_limit,
         logging_steps=args.logging_steps,
         fp16=args.fp16,
-        report_to=report_to,
+        report_to=args.report_to,
         seed=args.seed,
     )
 
@@ -382,7 +372,15 @@ def main():
         args=training_args,
         train_dataset=lm_datasets,
         data_collator=data_collator,
-        callbacks=[ValidationCallback(tokenizer, args.validation_prompts, args.validation_interval, report_to, args.output_dir)]
+        callbacks=[
+            ValidationCallback(
+                tokenizer=tokenizer,
+                prompts=args.validation_prompts,
+                interval=args.validation_interval,
+                report_to=args.report_to,
+                output_dir=args.output_dir
+            )
+        ]
     )
 
     # Start training
