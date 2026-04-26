@@ -32,7 +32,42 @@ def parse_args():
         default=512,
         help="Image size used by YOLODataset preprocessing.",
     )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=15000,
+        help="Number of samples kept in memory before flushing to a parquet shard.",
+    )
     return parser.parse_args()
+
+
+def generate_examples(dataset, start_idx, end_idx):
+    for i in range(start_idx, end_idx):
+        item = dataset[i]
+
+        # Convert image tensor back to PIL format
+        img_pil = TF.to_pil_image(item["img"])
+
+        # Retrieve classes and boxes
+        cls_ids = item["cls"].flatten().tolist()
+        bboxes = item["bboxes"].tolist() if len(item["bboxes"]) > 0 else []
+
+        # Map class IDs to category names
+        class_names = dataset.data['names']
+        categories = [int(c) for c in cls_ids]
+        category_names = [class_names.get(int(c), str(c)) for c in cls_ids]
+
+        yield {
+            "image": img_pil,
+            "width": img_pil.width,
+            "height": img_pil.height,
+            "objects": {
+                "bbox": bboxes,
+                "category": categories,
+                "category_name": category_names,
+            },
+        }
+
 
 def main():
     # Parse arguments
@@ -41,8 +76,10 @@ def main():
     # Load dataset info from YOLODataset
     print(f"Loading dataset from: {args.input_path}")
     dataset_info = check_det_dataset(args.input_path)
-    
-    class_names = dataset_info.get("names", {})
+
+    # Create output directory if it doesn't exist
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     for split in ["train", "val", "test"]:
         if split not in dataset_info: continue
@@ -56,49 +93,25 @@ def main():
             rect=False
         )
         
-        print(f"Processing {split} split, {len(dataset.labels)} images...")
-        
-        hf_data = {
-            "image": [],
-            "objects": [],
-            "width": [],
-            "height": []
-        }
-        
-        # Iterate through the dataset and convert to HuggingFace format
-        for i in tqdm(range(len(dataset))):
-            # Get the image and annotations
-            item = dataset[i]
-            
-            # Convert image tensor back to PIL format
-            img_pil = TF.to_pil_image(item["img"])
-            
-            # Retrieve classes and boxes
-            cls_ids = item["cls"].flatten().tolist()
-            bboxes = item["bboxes"].tolist() if len(item["bboxes"]) > 0 else []
-            
-            # Map class IDs to category names
-            categories = [int(c) for c in cls_ids]
-            category_names = [class_names.get(int(c), str(c)) for c in cls_ids]
-            
-            # Append data to HuggingFace dataset format
-            hf_data["image"].append(img_pil)
-            hf_data["width"].append(img_pil.width) 
-            hf_data["height"].append(img_pil.height)
-            hf_data["objects"].append({
-                "bbox": bboxes, 
-                "category": categories,
-                "category_name": category_names
-            })
-            
-        # Convert to HuggingFace dataset and save as parquet
-        hf_dataset = datasets.Dataset.from_dict(hf_data)
-        hf_dataset = hf_dataset.cast_column("image", datasets.Image())
-        
-        # Save the dataset in parquet format
-        output_file = Path(args.output_dir) / f"{split}.parquet"
-        hf_dataset.to_parquet(output_file)
-        print(f"Saved {split} to {output_file}")
+        print(f"\nProcessing {split} split, {len(dataset.labels)} images...")
+        shard_idx = 0
+        for start_idx in range(0, len(dataset), args.chunk_size):
+            end_idx = min(start_idx + args.chunk_size, len(dataset))
+            hf_dataset = datasets.Dataset.from_generator(
+                generate_examples,
+                gen_kwargs={
+                    "dataset": dataset,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                },
+            )
+            hf_dataset = hf_dataset.cast_column("image", datasets.Image())
+
+            output_file = output_dir / f"{split}-{shard_idx:05d}.parquet"
+            hf_dataset.to_parquet(output_file)
+            shard_idx += 1
+
+        print(f"Finished {split}, total shards: {shard_idx}")
 
 
 if __name__ == "__main__":
