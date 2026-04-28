@@ -1,12 +1,14 @@
-import argparse
-import importlib
 import os
 import re
-
+import logging
+import argparse
+import datetime
 import numpy as np
+from pathlib import Path
+from PIL import Image, ImageDraw
+
 import torch
 from datasets import load_dataset
-from PIL import Image, ImageDraw
 from transformers import (
     Trainer, 
     TrainingArguments, 
@@ -25,6 +27,9 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -103,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--logging_steps",
         type=int,
-        default=100,
+        default=None,
         help="Log training metrics every X steps"
     )
 
@@ -115,9 +120,9 @@ def parse_args():
         help="Prompts for text generation during training"
     )
     parser.add_argument(
-        "--validation_interval",
+        "--validation_steps",
         type=int,
-        default=500,
+        default=None,
         help="Generate text samples every X steps"
     )
     parser.add_argument(
@@ -234,8 +239,9 @@ class ValidationCallback(TrainerCallback):
                 response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
                 # Log the prompt and response for debugging
-                print(f"\n[prompt]: {prompt}\n [response]: {response}\n")
-                
+                logger.info(f"###prompt: {prompt}")
+                logger.info(f"###response: {response}")
+
                 # Attempt to parse the response and log the results
                 parsed_results.append(self._parse_string(response))
 
@@ -325,6 +331,21 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    # Set logging
+    logging_dir = Path(args.output_dir) / "logs"
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[
+            logging.FileHandler(logging_dir / f"{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log"),
+            logging.StreamHandler()  # Also output to console
+        ],
+    )
+    logger.info(f"Starting script: {Path(__file__).name}")
+
+    # Set reporting backends
     args.report_to = [r.strip() for r in args.report_to.split(",") if r.strip()]
     if len(args.report_to) == 0 or args.report_to == ["none"]:
         args.report_to = "none"
@@ -346,11 +367,21 @@ def main():
     # Load model
     model = AutoModelForCausalLM.from_pretrained(args.pretrained_model_name_or_path)
 
+    # Logging configuration and model details
+    logger.info(f"Training Arguments: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(args).items()])} \n")
+    logger.info(f"Model Config: \n {model.config}")
+
     # Data collator for language modeling (causal language modeling)
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False
     )
+
+    # Check if checkpointing steps and validation steps are set, otherwise use default values
+    steps_per_epoch = len(lm_datasets) // args.per_device_train_batch_size
+    args.save_steps = args.save_steps if args.save_steps else steps_per_epoch
+    args.logging_steps = args.logging_steps if args.logging_steps else steps_per_epoch
+    args.validation_steps = args.validation_steps if args.validation_steps else steps_per_epoch
 
     # Training arguments
     training_args = TrainingArguments(
@@ -376,7 +407,7 @@ def main():
             ValidationCallback(
                 tokenizer=tokenizer,
                 prompts=args.validation_prompts,
-                interval=args.validation_interval,
+                interval=args.validation_steps,
                 report_to=args.report_to,
                 output_dir=args.output_dir
             )
@@ -384,11 +415,14 @@ def main():
     )
 
     # Start training
+    logger.info("Starting training...")
     trainer.train()
 
     # Save final model and tokenizer
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
+
+    logger.info("Training completed successfully!")
 
 
 if __name__ == "__main__":
