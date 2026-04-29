@@ -211,9 +211,26 @@ class ValidationCallback(TrainerCallback):
             }
             wandb.log(payload, step=state.global_step)
 
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+
+        if state.global_step == 0 or state.global_step % self.interval != 0:
+            return control
+        
+        logger.info(
+            f"step: {state.global_step} | "
+            f"loss: {logs.get('loss', 'N/A'):.4f} | "
+            f"grad_norm: {logs.get('grad_norm', 'N/A'):.4f} | "
+            f"learning_rate: {logs.get('learning_rate', 'N/A'):.4e}"
+        )
+
+        return control
+
     def on_step_end(self, args, state, control, **kwargs):
         if self.interval <= 0:
             return control
+        
         if state.global_step == 0 or state.global_step % self.interval != 0:
             return control
 
@@ -239,8 +256,8 @@ class ValidationCallback(TrainerCallback):
                 response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
                 # Log the prompt and response for debugging
-                logger.info(f"###prompt: {prompt}")
-                logger.info(f"###response: {response}")
+                logger.info(f"PROMPT:   {prompt}")
+                logger.info(f"RESPONSE: {response}")
 
                 # Attempt to parse the response and log the results
                 parsed_results.append(self._parse_string(response))
@@ -271,7 +288,7 @@ class ValidationCallback(TrainerCallback):
                     draw.rectangle([(x1, y1), (x2, y2)], outline="white", width=2)
                     draw.text((x1, max(0, y1 - 12)), label, fill="white")
             
-            # Update
+            # Update images list
             images.append(img)
 
         self._log_images(images, state)
@@ -280,8 +297,10 @@ class ValidationCallback(TrainerCallback):
         return control
 
     def on_train_end(self, args, state, control, **kwargs):
+        # Close TensorBoard writer if it was used
         if self.tb_writer is not None:
             self.tb_writer.close()
+        
         return control
 
 
@@ -339,7 +358,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[
-            logging.FileHandler(logging_dir / f"{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.log"),
+            logging.FileHandler(logging_dir / f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
             logging.StreamHandler()  # Also output to console
         ],
     )
