@@ -1,13 +1,14 @@
-import os
 import re
 import logging
 import argparse
-import datetime
 import numpy as np
 from pathlib import Path
+from datetime import datetime
 from PIL import Image, ImageDraw
 
 import torch
+from accelerate import Accelerator
+from accelerate.logging import get_logger
 from datasets import load_dataset
 from transformers import (
     Trainer, 
@@ -19,17 +20,12 @@ from transformers import (
 )
 
 try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    SummaryWriter = None
-    
-try:
     import wandb
 except ImportError:
     wandb = None
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def parse_args():
@@ -127,23 +123,30 @@ def parse_args():
     )
     parser.add_argument(
         "--report_to",
-        type=str,
-        default="tensorboard",
+        nargs="+",
+        default=["tensorboard", "wandb"],
         help="Comma separated tracking backends: none, tensorboard, wandb"
+    )
+
+    # Accelerator
+    parser.add_argument(
+        "--tracker_name",
+        type=str,
+        default="gpt2-train",
+        help="Name for the accelerator tracker (e.g., for TensorBoard or WandB logging)"
     )
     
     return parser.parse_args()
 
 
 class ValidationCallback(TrainerCallback):
-    def __init__(self, tokenizer, prompts, interval, report_to, output_dir):
+    def __init__(self, tokenizer, accelerator, logging_steps, validation_prompts, validation_steps, img_sz=512):
         self.tokenizer = tokenizer
-        self.prompts = prompts
-        self.interval = interval
-        self.report_to = report_to
-        self.output_dir = output_dir
-        self.tb_writer = None
-        self.img_sz = 512
+        self.accelerator = accelerator
+        self.logging_steps = logging_steps
+        self.validation_prompts = validation_prompts
+        self.validation_steps = validation_steps
+        self.img_sz = img_sz
 
     @staticmethod
     def _parse_string(decoded_text):
@@ -188,34 +191,28 @@ class ValidationCallback(TrainerCallback):
         return parsed_results
 
     def _log_images(self, images, state):
-        if "tensorboard" in self.report_to and SummaryWriter is not None:
-            # Initialize SummaryWriter if not already done
-            if self.tb_writer is None:
-                self.tb_writer = SummaryWriter(log_dir=os.path.join(self.output_dir, "validation_images"))
+        for tracker in self.accelerator.trackers:
+            if tracker.name == "tensorboard" and tracker.writer is not None:
+                for i, img in enumerate(images):
+                    tracker.writer.add_image(
+                        tag=f"validation/prompt_{i}",
+                        img_tensor=np.array(img),
+                        global_step=state.global_step,
+                        dataformats="HWC",
+                    )
+                tracker.writer.flush()
 
-            # Log each image with a unique tag
-            for i, img in enumerate(images):
-                self.tb_writer.add_image(
-                    tag=f"validation/prompt_{i}",
-                    img_tensor=np.array(img),
-                    global_step=state.global_step,
-                    dataformats="HWC",
-                )
-                
-            self.tb_writer.flush()
-
-        if "wandb" in self.report_to and wandb is not None:
-            payload = {
-                f"validation/prompt_{i}": wandb.Image(img, caption=f"step={state.global_step}, prompt_id={i}")
-                for i, img in enumerate(images)
-            }
-            wandb.log(payload, step=state.global_step)
+            elif tracker.name == "wandb" and wandb is not None:
+                tracker.log({
+                    f"validation/prompt_{i}": wandb.Image(img, caption=f"step={state.global_step}, prompt_id={i}")
+                    for i, img in enumerate(images)
+                }, step=state.global_step)
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not logs:
             return
 
-        if state.global_step == 0 or state.global_step % self.interval != 0:
+        if self.logging_steps <= 0 or state.global_step == 0 or state.global_step % self.logging_steps != 0:
             return control
         
         logger.info(
@@ -225,13 +222,30 @@ class ValidationCallback(TrainerCallback):
             f"learning_rate: {logs.get('learning_rate', 'N/A'):.4e}"
         )
 
+        scalar = {
+            "train/loss": logs.get("loss"),
+            "train/grad_norm": logs.get("grad_norm"),
+            "train/learning_rate": logs.get("learning_rate"),
+        }
+        for tracker in self.accelerator.trackers:
+            if tracker.name == "tensorboard" and tracker.writer is not None:
+                for key, value in scalar.items():
+                    tracker.writer.add_scalar(key, value, state.global_step)
+                tracker.writer.flush()
+
+            elif tracker.name == "wandb" and wandb is not None:
+                tracker.log(scalar, step=state.global_step)
+
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
-        if self.interval <= 0:
+        if self.validation_steps <= 0:
             return control
         
-        if state.global_step == 0 or state.global_step % self.interval != 0:
+        if state.global_step == 0 or state.global_step % self.validation_steps != 0:
+            return control
+
+        if not self.accelerator.is_main_process:
             return control
 
         # Initialize model and device
@@ -242,7 +256,7 @@ class ValidationCallback(TrainerCallback):
         # Generate text for each prompt and decode
         parsed_results = []
         with torch.no_grad():
-            for prompt in self.prompts:
+            for prompt in self.validation_prompts:
                 inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
                 outputs = model.generate(
                     **inputs,
@@ -293,13 +307,6 @@ class ValidationCallback(TrainerCallback):
 
         self._log_images(images, state)
         model.train()
-
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        # Close TensorBoard writer if it was used
-        if self.tb_writer is not None:
-            self.tb_writer.close()
         
         return control
 
@@ -344,30 +351,26 @@ def preprocess(examples, tokenizer, block_size):
 
 
 def main():
-    # Set TOKENIZERS_PARALLELISM to suppress huggingface tokenizers warning
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     # Parse arguments
     args = parse_args()
 
+    # Prepare accelerator
+    accelerator = Accelerator(log_with=args.report_to, project_dir=args.output_dir)
+    accelerator.init_trackers(args.tracker_name)
+
     # Set logging
-    logging_dir = Path(args.output_dir) / "logs"
+    logging_dir = Path(args.output_dir) / args.tracker_name
     logging_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[
-            logging.FileHandler(logging_dir / f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
-            logging.StreamHandler()  # Also output to console
+            logging.FileHandler(logging_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
         ],
     )
     logger.info(f"Starting script: {Path(__file__).name}")
-
-    # Set reporting backends
-    args.report_to = [r.strip() for r in args.report_to.split(",") if r.strip()]
-    if len(args.report_to) == 0 or args.report_to == ["none"]:
-        args.report_to = "none"
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path)
@@ -412,7 +415,6 @@ def main():
         save_total_limit=args.save_total_limit,
         logging_steps=args.logging_steps,
         fp16=args.fp16,
-        report_to=args.report_to,
         seed=args.seed,
     )
 
@@ -425,10 +427,10 @@ def main():
         callbacks=[
             ValidationCallback(
                 tokenizer=tokenizer,
-                prompts=args.validation_prompts,
-                interval=args.validation_steps,
-                report_to=args.report_to,
-                output_dir=args.output_dir
+                accelerator=accelerator,
+                logging_steps=args.logging_steps,
+                validation_prompts=args.validation_prompts,
+                validation_steps=args.validation_steps,
             )
         ]
     )
@@ -441,6 +443,8 @@ def main():
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 
+    # End of training
+    accelerator.end_training()
     logger.info("Training completed successfully!")
 
 
