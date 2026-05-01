@@ -17,13 +17,13 @@ def parse_args():
     parser.add_argument(
         "--gpt_model", 
         type=str, 
-        default="/home/23132798r/workspace/tmp-inspector/outputs/tmp-gpt2-fire",
+        required=True,
         help="Path to trained GPT-2 model."
     )
     parser.add_argument(
         "--prompt_csv", 
         type=str, 
-        default="/home/23132798r/workspace/tmp-inspector/config/prompt.csv",
+        required=True,
         help="CSV file with columns: id,category,small,medium,large."
     )
     parser.add_argument(
