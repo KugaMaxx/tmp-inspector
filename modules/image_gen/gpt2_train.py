@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument(
         "--coco_dataset_name_or_path",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/data/coco/hf_datasets",
+        default=None,
         help=
         (
             "Path to the COCO dataset in HuggingFace (parquet) format, read for augmentation."
