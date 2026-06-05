@@ -472,17 +472,19 @@ def main():
                 continue
 
         # Save YOLO file
+        file_name = f"{idx:010d}"
+
         ## label file
-        with open(label_dir / f"{idx:10d}.txt", "w") as f:
+        with open(label_dir / f"{file_name}.txt", "w") as f:
             for class_id, (_, bbox) in zip(class_ids, bboxes):
                 f.write(f"{class_id} {bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n")
         
         ## image file
-        generated_image.save(image_dir / f"{idx:10d}.png")
+        generated_image.save(image_dir / f"{file_name}.png")
 
         ## preview file
         preview_image = draw_bboxes_on_image(generated_image, bboxes)
-        preview_image.save(preview_dir / f"{idx:10d}.png")
+        preview_image.save(preview_dir / f"{file_name}.png")
 
 
 if __name__ == "__main__":
