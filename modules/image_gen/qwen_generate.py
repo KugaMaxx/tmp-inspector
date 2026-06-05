@@ -135,8 +135,8 @@ def build_prompts(prompt_csv, max_objects_per_prompt):
     object_pool = []
     df = pd.read_csv(
         prompt_csv,
-        usecols=["id", "category", "small", "medium", "large"],
-        dtype={"id": "int64", "category": "string", "small": "int64", "medium": "int64", "large": "int64"},
+        usecols=["id", "category", "xs", "s", "m", "l", "xl"],
+        dtype={"id": "int64", "category": "string", "xs": "int64", "s": "int64", "m": "int64", "l": "int64", "xl": "int64"},
         on_bad_lines="error",
     )
 
@@ -144,13 +144,17 @@ def build_prompts(prompt_csv, max_objects_per_prompt):
     for row in df.itertuples(index=False):
         class_id = int(row.id)
         category = " ".join(str(row.category).strip().lower().split())
-        small_n = max(0, int(row.small))
-        medium_n = max(0, int(row.medium))
-        large_n = max(0, int(row.large))
+        xs_n = max(0, int(row.xs))
+        s_n = max(0, int(row.s))
+        m_n = max(0, int(row.m))
+        l_n = max(0, int(row.l))
+        xl_n = max(0, int(row.xl))
 
-        object_pool.extend([(f"[small, {category}]", class_id)] * small_n)
-        object_pool.extend([(f"[medium, {category}]", class_id)] * medium_n)
-        object_pool.extend([(f"[large, {category}]", class_id)] * large_n)
+        object_pool.extend([(f"[xs, {category}]", class_id)] * xs_n)
+        object_pool.extend([(f"[s, {category}]", class_id)] * s_n)
+        object_pool.extend([(f"[m, {category}]", class_id)] * m_n)
+        object_pool.extend([(f"[l, {category}]", class_id)] * l_n)
+        object_pool.extend([(f"[xl, {category}]", class_id)] * xl_n)
 
     # Randomly consume object pool to create multiple random combinations
     items = []
@@ -173,20 +177,43 @@ def build_prompts(prompt_csv, max_objects_per_prompt):
 
 def extract_generated_bboxes(decoded_text):
     if ";" not in decoded_text:
-        return []
-    
-    BBOX_PATTERN = re.compile(
-        r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
-    )
+        return None
 
-    response_part = decoded_text.split(";", 1)[1]
-    boxes = []
-    for x_str, y_str, w_str, h_str in BBOX_PATTERN.findall(response_part):
-        x, y, w, h = float(x_str), float(y_str), float(w_str), float(h_str)
-        # keep only valid YOLO normalized values
-        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0:
-            boxes.append((x, y, w, h))
-    return boxes
+    # extract prompt and response parts
+    prompt, response = decoded_text.split(";", 1)
+    response = response.split(";", 1)[0]
+
+    # extract info
+    labels = re.findall(r"\[(.*?)\]", prompt)
+    bboxes = re.findall(r"\[(.*?)\]", response)
+
+    if len(labels) == 0 or len(bboxes) == 0 or len(labels) > len(bboxes):
+        return None
+
+    # only consider up to the number of labels
+    n = len(labels)
+
+    # parse bbox coordinates
+    parsed_results = []
+    for label, bbox in zip(labels[:n], bboxes[:n]):
+        vals = [v.strip() for v in bbox.split(",")]
+
+        # Expecting exactly 4 values: x, y, w, h
+        if len(vals) != 4:
+            return None
+        try:
+            x, y, w, h = [float(v) for v in vals]
+        except ValueError:
+            return None
+
+        # Strict [x, y, w, h] normalized format
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+            return None
+
+        # append valid bbox
+        parsed_results.append([label, [x, y, w, h]])
+
+    return parsed_results
 
 
 def write_yolo_label(label_path, class_ids, bboxes):
@@ -197,8 +224,9 @@ def write_yolo_label(label_path, class_ids, bboxes):
 
 
 def prompt_to_object_texts(prompt):
-    parts = re.findall(r"\[\s*(small|medium|large)\s*,\s*([^\]]+?)\s*\]", prompt, flags=re.IGNORECASE)
-    return [f"{size.lower()} {category.strip()}" for size, category in parts]
+    parts = re.findall(r"\[\s*(xs|s|m|l|xl)\s*,\s*([^\]]+?)\s*\]", prompt, flags=re.IGNORECASE)
+    # return [f"{size.lower()} {category.strip()}" for size, category in parts]
+    return [f"{category.strip()}" for size, category in parts]
 
 
 def yolo_to_xyxy(box, resolution):
@@ -227,6 +255,24 @@ def draw_condition_image(bboxes, resolution, outline_width=6):
     return img
 
 
+def draw_bboxes_on_image(image, bboxes, outline_width=12):
+    preview_img = image.copy()
+    draw = ImageDraw.Draw(preview_img)
+    width, height = preview_img.size
+
+    for box in bboxes:
+        x1, y1, x2, y2 = yolo_to_xyxy(box, width)
+        x1 = max(0.0, min(float(width - 1), x1))
+        y1 = max(0.0, min(float(height - 1), y1))
+        x2 = max(0.0, min(float(width - 1), x2))
+        y2 = max(0.0, min(float(height - 1), y2))
+
+        if x2 > x1 and y2 > y1:
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
+
+    return preview_img
+
+
 def main():
     # Parse arguments
     args = parse_args()
@@ -236,10 +282,12 @@ def main():
     labels_dir = output_root / "labels"
     condition_images_dir = output_root / "condition_images"
     generated_images_dir = output_root / "images"
+    preview_dir = output_root / "preview"
 
     labels_dir.mkdir(parents=True, exist_ok=True)
     condition_images_dir.mkdir(parents=True, exist_ok=True)
     generated_images_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir.mkdir(parents=True, exist_ok=True)
 
     # Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.gpt_model)
@@ -249,10 +297,9 @@ def main():
     gpt_ml.eval()
 
     # Load Qwen image pipeline
-    qwen_dtype = torch.bfloat16 if args.device.startswith("cuda") and torch.cuda.is_available() else torch.float32
     qwen_pipeline = QwenImageEditPlusPipeline.from_pretrained(
         args.qwen_model,
-        torch_dtype=qwen_dtype,
+        torch_dtype=torch.bfloat16,
     )
 
     if args.cpu_offload and args.device.startswith("cuda"):
@@ -280,38 +327,40 @@ def main():
             )
         decoded_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        # 
-        bboxes = extract_generated_bboxes(decoded_text)
-        n = min(len(prompt_class_ids), len(bboxes))
-        aligned_class_ids = prompt_class_ids[:n]
-        aligned_bboxes = bboxes[:n]
+        # Parse generated text to extract bounding boxes
+        parsed_results = extract_generated_bboxes(decoded_text)
+        if parsed_results is None: continue
 
         label_path = labels_dir / f"{idx:06d}.txt"
-        write_yolo_label(label_path, aligned_class_ids, aligned_bboxes)
+        write_yolo_label(label_path, prompt_class_ids, [bbox for _, bbox in parsed_results])
 
         # Build condition image from generated bboxes
-        condition_img = draw_condition_image(aligned_bboxes, args.resolution)
+        condition_img = draw_condition_image([bbox for _, bbox in parsed_results], args.resolution)
         condition_path = condition_images_dir / f"{idx:06d}.jpg"
         condition_img.save(condition_path, "JPEG", quality=95)
 
         # Build Qwen prompt and generate final image
         object_texts = prompt_to_object_texts(prompt)
-        object_texts = object_texts[:n]
         objects_desc = ", ".join(object_texts) if object_texts else "target objects"
         qwen_prompt = args.qwen_prompt.format(objects=objects_desc)
 
-        generated_img = qwen_pipeline(
-            image=[condition_img],
-            prompt=qwen_prompt,
-            negative_prompt=args.negative_prompt,
-            guidance_scale=args.guidance_scale,
-            true_cfg_scale=args.true_cfg_scale,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=1,
-        ).images[0]
+        with torch.inference_mode():
+            generated_img = qwen_pipeline(
+                image=[condition_img],
+                prompt=qwen_prompt,
+                negative_prompt=args.negative_prompt,
+                guidance_scale=args.guidance_scale,
+                true_cfg_scale=args.true_cfg_scale,
+                num_inference_steps=args.num_inference_steps,
+                num_images_per_prompt=1,
+            ).images[0]
 
         generated_path = generated_images_dir / f"{idx:06d}.jpg"
         generated_img.save(generated_path, "JPEG", quality=95)
+
+        preview_img = draw_bboxes_on_image(generated_img, [bbox for _, bbox in parsed_results])
+        preview_path = preview_dir / f"{idx:06d}.jpg"
+        preview_img.save(preview_path, "JPEG", quality=95)
 
 
 if __name__ == "__main__":

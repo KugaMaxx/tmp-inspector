@@ -51,7 +51,13 @@ def parse_args():
         "--dataset_name_or_path",
         type=str,
         required=True,
-        help="Name or path of the dataset (HuggingFace dataset name or local path)"
+        help="Name or path of the target dataset (HuggingFace dataset name or local path)"
+    )
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train",
+        help="Split of the target dataset to train on."
     )
     parser.add_argument(
         "--block_size",
@@ -165,7 +171,7 @@ def parse_args():
     parser.add_argument(
         "--logging_steps",
         type=int,
-        default=1000,
+        default=None,
         help="Log training metrics every X steps"
     )
 
@@ -455,6 +461,7 @@ class ValidationCallback(TrainerCallback):
         )
 
         scalar = {
+            "train/epoch": state.epoch,
             "train/loss": logs.get("loss"),
             "train/grad_norm": logs.get("grad_norm"),
             "train/learning_rate": logs.get("learning_rate"),
@@ -586,13 +593,20 @@ def main():
     # Parse arguments
     args = parse_args()
 
+    # Define logging directory
+    logging_dir = Path(args.output_dir) / "logs" / args.tracker_name
+    logging_dir.mkdir(parents=True, exist_ok=True)
+
     # Prepare accelerator
-    accelerator = Accelerator(log_with=args.report_to, project_dir=args.output_dir)
-    accelerator.init_trackers(args.tracker_name)
+    accelerator = Accelerator(log_with=args.report_to, project_dir=Path(args.output_dir) / "logs")
+    accelerator.init_trackers(
+        args.tracker_name,
+        init_kwargs={
+            "wandb": {"dir": logging_dir} if wandb is not None else {},
+        }
+    )
 
     # Set logging
-    logging_dir = Path(args.output_dir) / args.tracker_name
-    logging_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
