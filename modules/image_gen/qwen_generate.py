@@ -101,7 +101,7 @@ def parse_args():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.0,
+        default=4.0,
         help="Classifier-free guidance scale for Qwen image generation."
     )
     parser.add_argument(
@@ -462,7 +462,7 @@ def main():
                     negative_prompt=args.qwen_negative_prompt,
                     generator=torch.manual_seed(args.seed if args.seed is not None else random.randint(0, int(1e6))),
                     num_inference_steps=args.num_inference_steps,
-                    cfg_scale=args.cfg_scale,
+                    true_cfg_scale=args.cfg_scale,
                 ).images[0]
         else:
             try:
