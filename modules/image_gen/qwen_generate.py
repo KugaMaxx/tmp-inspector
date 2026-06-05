@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 import pandas as pd
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from diffusers import QwenImageEditPlusPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -238,6 +238,23 @@ def yolo_to_xyxy(box, resolution):
     return x1, y1, x2, y2
 
 
+def color_for_label(label):
+    palette = [
+        (255, 59, 48),
+        (52, 199, 89),
+        (0, 122, 255),
+        (255, 149, 0),
+        (175, 82, 222),
+        (255, 45, 85),
+        (90, 200, 250),
+        (255, 204, 0),
+        (48, 209, 88),
+        (64, 156, 255),
+    ]
+    idx = int.from_bytes(label.encode("utf-8"), "little", signed=False) % len(palette)
+    return palette[idx]
+
+
 def draw_condition_image(bboxes, resolution, outline_width=6):
     img = Image.new("RGB", (resolution, resolution), color=(0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -255,12 +272,13 @@ def draw_condition_image(bboxes, resolution, outline_width=6):
     return img
 
 
-def draw_bboxes_on_image(image, bboxes, outline_width=12):
+def draw_bboxes_on_image(image, bboxes, outline_width=6):
     preview_img = image.copy()
     draw = ImageDraw.Draw(preview_img)
+    font = ImageFont.load_default()
     width, height = preview_img.size
 
-    for box in bboxes:
+    for label, box in bboxes:
         x1, y1, x2, y2 = yolo_to_xyxy(box, width)
         x1 = max(0.0, min(float(width - 1), x1))
         y1 = max(0.0, min(float(height - 1), y1))
@@ -268,7 +286,20 @@ def draw_bboxes_on_image(image, bboxes, outline_width=12):
         y2 = max(0.0, min(float(height - 1), y2))
 
         if x2 > x1 and y2 > y1:
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
+            color = color_for_label(label)
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=outline_width)
+
+            text = str(label)
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            text_width = right - left
+            text_height = bottom - top
+            text_x = x1
+            text_y = max(0.0, y1 - text_height - 4)
+            draw.rectangle(
+                [text_x, text_y, text_x + text_width + 6, text_y + text_height + 4],
+                fill=color,
+            )
+            draw.text((text_x + 3, text_y + 2), text, fill=(255, 255, 255), font=font)
 
     return preview_img
 
@@ -358,7 +389,7 @@ def main():
         generated_path = generated_images_dir / f"{idx:06d}.jpg"
         generated_img.save(generated_path, "JPEG", quality=95)
 
-        preview_img = draw_bboxes_on_image(generated_img, [bbox for _, bbox in parsed_results])
+        preview_img = draw_bboxes_on_image(generated_img, parsed_results)
         preview_path = preview_dir / f"{idx:06d}.jpg"
         preview_img.save(preview_path, "JPEG", quality=95)
 
