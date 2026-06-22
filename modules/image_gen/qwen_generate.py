@@ -1,10 +1,9 @@
-import io
 import re
 import base64
 import random
 import argparse
 from pathlib import Path
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 import torch
 import pandas as pd
@@ -12,14 +11,6 @@ import pandas as pd
 from diffusers import QwenImageEditPlusPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import requests
-import dashscope
-from dashscope import MultiModalConversation
-
-
-# API Configuration
-API_KEY = "Your-API-Key"
-dashscope.base_http_api_url = "https://dashscope.aliyuncs.com/api/v1"
 
 def parse_args():
     parser = argparse.ArgumentParser(description="AI Image Generator.")
@@ -84,19 +75,19 @@ def parse_args():
         "--qwen_prompt_template",
         type=str,
         default=(
-            "replace ONLY the red bounding boxes with: {objects}. "
-            "make them appear as if they were always part of the scene. "
-            "keep object count and positions aligned with the red boxes. "
-            "consistent lighting with surroundings, photorealistic indoor environment. "
-            "do not change image size."
+            "Replace the red bounding box with {objects}. "
+            "The placeholder {objects} must only appear within the red box and match the box in dimensions. "
+            "A real-scene background shall be adopted."
         ),
         help="Template for image generation prompt.",
     )
     parser.add_argument(
         "--qwen_negative_prompt",
         type=str,
-        default="text, watermark, logo, red outline, red rectangle, distorted",
-        help="Negative prompt for Qwen image generation."
+        default=(
+            "{objects} should not appear outside the red bounding box. "
+        ),
+        help="Negative prompt for image generation.",
     )
     parser.add_argument(
         "--cfg_scale",
@@ -143,8 +134,8 @@ def parse_args():
 def prepare_gpt_prompts(args):
     df = pd.read_csv(
         args.gpt_prompt_config,
-        usecols=["id", "category", "xs", "s", "m", "l", "xl", "description"],
-        dtype={"id": "int64", "category": "string", "xs": "int64", "s": "int64", "m": "int64", "l": "int64", "xl": "int64", "description": "string"},
+        usecols=["id", "category", "xs", "s", "m", "l", "xl"],
+        dtype={"id": "int64", "category": "string", "xs": "int64", "s": "int64", "m": "int64", "l": "int64", "xl": "int64"},
         on_bad_lines="error",
     )
 
@@ -152,7 +143,6 @@ def prepare_gpt_prompts(args):
     object_pool = []
     for row in df.itertuples(index=False):
         class_id = int(row.id)
-        class_desc = " ".join(str(row.description).strip().lower().split())
         category = " ".join(str(row.category).strip().lower().split())
 
         xs_n = max(0, int(row.xs))
@@ -161,11 +151,11 @@ def prepare_gpt_prompts(args):
         l_n = max(0, int(row.l))
         xl_n = max(0, int(row.xl))
 
-        object_pool.extend([(f"[xs, {category}]", class_id, class_desc)] * xs_n)
-        object_pool.extend([(f"[s, {category}]",  class_id, class_desc)] * s_n)
-        object_pool.extend([(f"[m, {category}]",  class_id, class_desc)] * m_n)
-        object_pool.extend([(f"[l, {category}]",  class_id, class_desc)] * l_n)
-        object_pool.extend([(f"[xl, {category}]", class_id, class_desc)] * xl_n)
+        object_pool.extend([(f"[xs, {category}]", class_id)] * xs_n)
+        object_pool.extend([(f"[s, {category}]",  class_id)] * s_n)
+        object_pool.extend([(f"[m, {category}]",  class_id)] * m_n)
+        object_pool.extend([(f"[l, {category}]",  class_id)] * l_n)
+        object_pool.extend([(f"[xl, {category}]", class_id)] * xl_n)
 
     # Randomly consume object pool to create multiple random combinations
     items = []
@@ -183,10 +173,9 @@ def prepare_gpt_prompts(args):
             selected.append(object_pool.pop(i))
         random.shuffle(selected)
 
-        prompt = ", ".join([p for p, _, _ in selected]) + " ;"
-        class_ids = [cid for _, cid, _ in selected]
-        class_desc = [desc for _, _, desc in selected]
-        items.append((prompt, class_ids, class_desc))
+        prompt = ", ".join([p for p, _ in selected]) + " ;"
+        class_ids = [cid for _, cid in selected]
+        items.append((prompt, class_ids))
 
     return items
 
@@ -232,9 +221,42 @@ def extract_bboxes_from_text(output_text):
     return parsed_results
 
 
-def draw_condition_image(bboxes, resolution, outline_width=24):
-    img = Image.new("RGB", (resolution, resolution), color="black")
-    draw = ImageDraw.Draw(img)
+# Palette of visually distinct colors. Each entry maps a color name to its RGB
+# value so the same name can be referenced in the Qwen prompt.
+COLOR_PALETTE = [
+    ("red",     (255, 0, 0)),
+    ("green",   (0, 200, 0)),
+    ("blue",    (0, 0, 255)),
+    ("yellow",  (255, 255, 0)),
+    ("magenta", (255, 0, 255)),
+    ("cyan",    (0, 255, 255)),
+    ("orange",  (255, 128, 0)),
+    ("purple",  (140, 0, 255)),
+    ("pink",    (255, 105, 180)),
+    ("lime",    (170, 255, 0)),
+    ("teal",    (0, 160, 160)),
+    ("brown",   (150, 75, 0)),
+]
+
+
+def allocate_bbox_colors(n):
+    palette = COLOR_PALETTE.copy()
+    random.shuffle(palette)
+    if n <= len(palette):
+        return palette[:n]
+    return [palette[i % len(palette)] for i in range(n)]
+
+
+def draw_condition_image(bboxes, resolution, colors, alpha=64, draw_labels=False, background=None):
+    if background is None:
+        base = Image.new("RGBA", (resolution, resolution), color=(0, 0, 0, 255))
+    else:
+        base = background.convert("RGBA")
+
+    width, height = base.size
+    overlay = Image.new("RGBA", (width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default(size=24)
 
     for _, bbox in bboxes:
         x, y, w, h = bbox
@@ -243,70 +265,9 @@ def draw_condition_image(bboxes, resolution, outline_width=24):
         right  = int((x + w / 2.0) * resolution)
         bottom = int((y + h / 2.0) * resolution)
 
-        draw.rectangle([left, top, right, bottom], outline="red", width=outline_width)
+        draw.rectangle([left, top, right, bottom], outline="red", fill="red", width=outline_width)
 
     return img
-
-
-def image_to_base64(image):
-    """Convert PIL Image to base64 string for API transmission."""
-    buffered = io.BytesIO()
-    image.save(buffered, format="JPEG", quality=95)
-    img_bytes = buffered.getvalue()
-    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-    return f"data:image/jpeg;base64,{img_base64}"
-
-
-def generate_image_with_api(condition_image, prompt, args):
-    """Generate image using Qwen API with base64 encoded condition image."""
-    # Convert condition image to base64
-    image_base64 = image_to_base64(condition_image)
-
-    # Prepare messages for API
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"image": image_base64},
-                {"text": prompt}
-            ]
-        }
-    ]
-
-    # Determine seed
-    seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
-
-    # Call API
-    response = MultiModalConversation.call(
-        api_key=API_KEY,
-        model=args.qwen_model.replace("api:", ""),
-        messages=messages,
-        result_format='message',
-        stream=False,
-        n=1,
-        watermark=False,
-        negative_prompt=args.qwen_negative_prompt,
-        seed=seed,
-        steps=args.num_inference_steps,
-    )
-
-    # Extract image URL from response
-    if response.status_code == 200:
-        output = response.output
-        if 'choices' in output and len(output['choices']) > 0:
-            choice = output['choices'][0]
-            if 'message' in choice and 'content' in choice['message']:
-                content = choice['message']['content']
-                # Content is a list, find the image URL
-                for item in content:
-                    if isinstance(item, dict) and 'image' in item:
-                        image_url = item['image']
-                        # Download the image
-                        img_response = requests.get(image_url, timeout=30)
-                        if img_response.status_code == 200:
-                            return Image.open(io.BytesIO(img_response.content))
-
-    raise RuntimeError(f"API call failed: {response}")
 
 
 def draw_bboxes_on_image(image, bboxes, outline_width=12):
@@ -315,12 +276,7 @@ def draw_bboxes_on_image(image, bboxes, outline_width=12):
     width, height = preview_img.size
 
     for entry in bboxes:
-        # support either plain box [x,y,w,h] or parsed entry [label, [x,y,w,h]]
-        if isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[0], str):
-            label, box = entry
-        else:
-            label = None
-            box = entry
+        label, box = entry
 
         try:
             x, y, w, h = box
@@ -338,44 +294,23 @@ def draw_bboxes_on_image(image, bboxes, outline_width=12):
         x2 = max(0.0, min(float(width - 1), x2))
         y2 = max(0.0, min(float(height - 1), y2))
 
-        if x2 > x1 and y2 > y1:
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
+        if x2 <= x1 or y2 <= y1 or label is None:
+            continue
 
-            # draw label if available (expecting format like "xs, category")
-            if label:
-                parts = [p.strip() for p in str(label).split(",")]
-                if len(parts) >= 2:
-                    size = parts[0]
-                    category = ",".join(parts[1:])
-                    text = f"{size} {category}"
-                else:
-                    text = parts[0]
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
 
-                # measure text
-                try:
-                    text_w, text_h = draw.textsize(text)
-                except Exception:
-                    # fallback
-                    text_w, text_h = (len(text) * 6, 12)
+        font = ImageFont.load_default()
+        (text_width, text_height), (_, _) = font.font.getsize(label)
+        text_x = x1 if x1 + text_width < width else width - text_width
+        text_y = y1 - text_height if y1 - text_height > 0 else 0
+        text_bbox = draw.textbbox((text_x, text_y), label, font=font)
 
-                # position text above the bbox if possible, otherwise below
-                pad = 4
-                tx1 = int(x1)
-                ty1 = int(y1) - text_h - pad
-                if ty1 < 0:
-                    ty1 = int(y2) + pad
-                tx2 = tx1 + text_w + pad
-                ty2 = ty1 + text_h + pad // 2
+        margin = int(min(width, height) * 0.01)
+        text_bbox = (text_bbox[0], text_bbox[1] - margin,
+                     text_bbox[2], text_bbox[3] + margin)
 
-                # clamp to image
-                tx1 = max(0, tx1)
-                ty1 = max(0, ty1)
-                tx2 = min(int(width - 1), tx2)
-                ty2 = min(int(height - 1), ty2)
-
-                # draw background rectangle and text
-                draw.rectangle([tx1, ty1, tx2, ty2], fill="black")
-                draw.text((tx1 + 2, ty1 + 1), text, fill="white")
+        draw.rectangle(text_bbox, fill="black")
+        draw.text((text_x, text_y), label, fill=(255, 255, 255), font=font)
 
     return preview_img
 
@@ -408,22 +343,18 @@ def main():
     gpt_items = prepare_gpt_prompts(args)
 
     # Load Qwen image edit model
-    if args.qwen_model.startswith("api:"):
-        print("Using API for Qwen image generation.")
-        qwen_pipeline = None
+    print("Loading Qwen image edit model...")
+    qwen_pipeline = QwenImageEditPlusPipeline.from_pretrained(
+        args.qwen_model,
+        torch_dtype=torch.bfloat16,
+    )
+
+    if args.cpu_offload and args.device.startswith("cuda"):
+        qwen_pipeline.enable_model_cpu_offload()
     else:
-        print("Loading Qwen image edit model...")
-        qwen_pipeline = QwenImageEditPlusPipeline.from_pretrained(
-            args.qwen_model,
-            torch_dtype=torch.bfloat16,
-        )
+        qwen_pipeline = qwen_pipeline.to(args.device)
 
-        if args.cpu_offload and args.device.startswith("cuda"):
-            qwen_pipeline.enable_model_cpu_offload()
-        else:
-            qwen_pipeline = qwen_pipeline.to(args.device)
-
-    for idx, (gpt_prompt, class_ids, class_desc) in enumerate(gpt_items):
+    for idx, (gpt_prompt, class_ids) in enumerate(gpt_items):
         print(idx)
 
         # Generate bounding boxes with GPT-2
@@ -446,30 +377,33 @@ def main():
             print("Failed to extract valid bounding boxes from GPT output. Skipping this item.")
             continue
 
+        # Assign a unique color to each bbox
+        colors = allocate_bbox_colors(len(bboxes))
+
         # Prepare Qwen prompt and condition image
-        qwen_prompt = args.qwen_prompt_template.format(
-            objects=bboxes[0][0].split(",")[1].strip(),
-            description="; ".join(class_desc)
+        qwen_prompt = " ".join(
+            args.qwen_prompt.format(
+                objects=label.split(",")[1].strip(),
+                color=color,
+            )
+            for (label, bbox), (color, rgb) in zip(bboxes, colors)
+        )
+        qwen_negative_prompt = args.qwen_negative_prompt
+        condition_image = draw_condition_image(
+            bboxes, args.resolution, colors
         )
         condition_image = draw_condition_image(bboxes, args.resolution)
 
         # Generate image with Qwen
-        if qwen_pipeline is not None:
-            with torch.inference_mode():
-                generated_image = qwen_pipeline(
-                    image=[condition_image],
-                    prompt=qwen_prompt,
-                    negative_prompt=args.qwen_negative_prompt,
-                    generator=torch.manual_seed(args.seed if args.seed is not None else random.randint(0, int(1e6))),
-                    num_inference_steps=args.num_inference_steps,
-                    true_cfg_scale=args.cfg_scale,
-                ).images[0]
-        else:
-            try:
-                generated_image = generate_image_with_api(condition_image, qwen_prompt, args)
-            except Exception as e:
-                print(f"API call failed: {e}. Skipping this item.")
-                continue
+        with torch.inference_mode():
+            generated_image = qwen_pipeline(
+                image=[condition_image],
+                prompt=qwen_prompt,
+                negative_prompt=qwen_negative_prompt,
+                generator=torch.manual_seed(args.seed if args.seed is not None else random.randint(0, int(1e6))),
+                num_inference_steps=args.num_inference_steps,
+                true_cfg_scale=args.cfg_scale,
+            ).images[0]
 
         # Save YOLO file
         file_name = f"{idx:010d}"
@@ -482,8 +416,11 @@ def main():
         ## image file
         generated_image.save(image_dir / f"{file_name}.png")
 
-        ## preview file
-        preview_image = draw_bboxes_on_image(generated_image, bboxes)
+        ## preview file: labeled masks overlaid on the AI result
+        preview_image = draw_condition_image(
+            bboxes, args.resolution, colors,
+            draw_labels=True, background=generated_image,
+        )
         preview_image.save(preview_dir / f"{file_name}.png")
 
 
