@@ -1,5 +1,4 @@
 import re
-import base64
 import random
 import argparse
 from pathlib import Path
@@ -85,7 +84,7 @@ def parse_args():
         "--qwen_negative_prompt",
         type=str,
         default=(
-            "{objects} should not appear outside the red bounding box. "
+            " "
         ),
         help="Negative prompt for image generation.",
     )
@@ -258,61 +257,23 @@ def draw_condition_image(bboxes, resolution, colors, alpha=64, draw_labels=False
     draw = ImageDraw.Draw(overlay)
     font = ImageFont.load_default(size=24)
 
-    for _, bbox in bboxes:
+    for (label, bbox), (_, rgb) in zip(bboxes, colors):
         x, y, w, h = bbox
-        left   = int((x - w / 2.0) * resolution)
-        top    = int((y - h / 2.0) * resolution)
-        right  = int((x + w / 2.0) * resolution)
-        bottom = int((y + h / 2.0) * resolution)
+        left   = int((x - w / 2.0) * width)
+        top    = int((y - h / 2.0) * height)
+        right  = int((x + w / 2.0) * width)
+        bottom = int((y + h / 2.0) * height)
 
-        draw.rectangle([left, top, right, bottom], outline="red", fill="red", width=outline_width)
+        # semi-transparent mask fill
+        draw.rectangle([left, top, right, bottom], fill=(*rgb, alpha))
 
-    return img
+        if draw_labels and label is not None:
+            (text_width, text_height), (_, _) = font.font.getsize(label)
+            text_x = left if left + text_width < width else width - text_width
+            text_y = top if top + text_height < height else height - text_height
+            draw.text((text_x, text_y), label, fill=(255, 255, 255, 255), font=font)
 
-
-def draw_bboxes_on_image(image, bboxes, outline_width=12):
-    preview_img = image.copy()
-    draw = ImageDraw.Draw(preview_img)
-    width, height = preview_img.size
-
-    for entry in bboxes:
-        label, box = entry
-
-        try:
-            x, y, w, h = box
-        except Exception:
-            continue
-
-        # convert normalized yolo to image coordinates (handles non-square images)
-        x1 = (x - w / 2.0) * width
-        y1 = (y - h / 2.0) * height
-        x2 = (x + w / 2.0) * width
-        y2 = (y + h / 2.0) * height
-
-        x1 = max(0.0, min(float(width - 1), x1))
-        y1 = max(0.0, min(float(height - 1), y1))
-        x2 = max(0.0, min(float(width - 1), x2))
-        y2 = max(0.0, min(float(height - 1), y2))
-
-        if x2 <= x1 or y2 <= y1 or label is None:
-            continue
-
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
-
-        font = ImageFont.load_default()
-        (text_width, text_height), (_, _) = font.font.getsize(label)
-        text_x = x1 if x1 + text_width < width else width - text_width
-        text_y = y1 - text_height if y1 - text_height > 0 else 0
-        text_bbox = draw.textbbox((text_x, text_y), label, font=font)
-
-        margin = int(min(width, height) * 0.01)
-        text_bbox = (text_bbox[0], text_bbox[1] - margin,
-                     text_bbox[2], text_bbox[3] + margin)
-
-        draw.rectangle(text_bbox, fill="black")
-        draw.text((text_x, text_y), label, fill=(255, 255, 255), font=font)
-
-    return preview_img
+    return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def main():
@@ -392,7 +353,6 @@ def main():
         condition_image = draw_condition_image(
             bboxes, args.resolution, colors
         )
-        condition_image = draw_condition_image(bboxes, args.resolution)
 
         # Generate image with Qwen
         with torch.inference_mode():
