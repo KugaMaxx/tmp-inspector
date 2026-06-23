@@ -1,4 +1,3 @@
-import io
 import math
 import random
 import argparse
@@ -22,7 +21,6 @@ from diffusers.training_utils import (
     cast_training_params,
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3,
-    free_memory,
 )
 from diffusers.optimization import get_scheduler
 from transformers import (
@@ -211,11 +209,39 @@ def parse_args():
         help="Directory to save LoRA adapters and training logs."
     )
 
+    # Checkpointing
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=None,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
+            " training using `--resume_from_checkpoint`."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help=("Max number of checkpoints to store."),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+        ),
+    )
+    
     return parser.parse_args()
 
 
-# Palette copied from qwen_generate.py so condition-image coloring and prompt
-# wording stay aligned between generation and training.
+# ------------------------------------------------------------------------------
+# Dataloader
+# ------------------------------------------------------------------------------
+
 COLOR_PALETTE = [
     "red",
     "green",
@@ -232,24 +258,98 @@ COLOR_PALETTE = [
 ]
 
 
-def allocate_bbox_colors(num_boxes):
+def allocate_bbox_colors(n):
     palette = COLOR_PALETTE.copy()
     random.shuffle(palette)
-    if num_boxes <= len(palette):
-        return palette[:num_boxes]
-    return [palette[i % len(palette)] for i in range(num_boxes)]
+    if n <= len(palette):
+        return palette[:n]
+    return [palette[i % len(palette)] for i in range(n)]
 
 
-def normalize_category_name(name):
-    return " ".join(str(name).strip().lower().split())
+def calculate_dimensions(target_area, ratio):
+    """Pick (w, h) with the given aspect ratio and ~target_area, rounded to /32."""
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+    return width, height
 
 
-def build_qwen_prompt(category_names, colors, template):
-    parts = []
-    for color, name in zip(colors, category_names):
-        parts.append(template.format(color=color, objects=normalize_category_name(name)))
-    return " ".join(parts) if parts else template.format(color="red", objects="object")
+def draw_condition_image(bboxes, width, height, colors, alpha=64):
+    base = Image.new("RGBA", (width, height), color=(0, 0, 0, 255))
+    overlay = Image.new("RGBA", (width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
 
+    for (label, bbox), (_, rgb) in zip(bboxes, colors):
+        x, y, w, h = bbox
+        left   = int((x - w / 2.0) * width)
+        top    = int((y - h / 2.0) * height)
+        right  = int((x + w / 2.0) * width)
+        bottom = int((y + h / 2.0) * height)
+
+        # semi-transparent mask fill
+        draw.rectangle([left, top, right, bottom], fill=(*rgb, alpha))
+
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def prepare_dataset(args, image_processor):
+    # Load the dataset
+    dataset = load_dataset(args.dataset_name_or_path, split="train")
+
+    # Drop rows without boxes
+    dataset = dataset.filter(lambda obj: len(obj["bbox"]) > 0, input_columns="objects")
+
+    # Randomly sample a subset if requested
+    if args.max_samples and args.max_samples > 0:
+        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+
+    def collate_fn(example):
+        bboxes = example["objects"].get("bbox")
+        labels = example["objects"].get("category_name")
+        bboxes = [(label, bbox) for label, bbox in zip(labels, bboxes)]
+        colors = allocate_bbox_colors(len(bboxes))
+
+        target = example["image"].convert("RGB")
+        tw, th = target.size
+        ratio = tw / th
+
+        vae_w, vae_h = calculate_dimensions(VAE_IMAGE_SIZE, ratio)
+        cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, ratio)
+
+        # Build condition image, drawn at the VAE resolution then resized for the text encoder
+        cond_full = draw_condition_image(bboxes, vae_w, vae_h, colors)
+        cond_for_text = image_processor.resize(cond_full, cond_h, cond_w)
+
+        # Build qwen prompt
+        qwen_prompt = " ".join(
+            args.qwen_prompt.format(
+                objects=label.split(",")[1].strip(),
+                color=color,
+            )
+            for (label, bbox), (color, rgb) in zip(bboxes, colors)
+        )
+
+        return {
+            "prompt": qwen_prompt,
+            "cond_for_text": cond_for_text,
+            "target_img": image_processor.preprocess(target, vae_h, vae_w).unsqueeze(2),
+            "cond_img": image_processor.preprocess(cond_full, vae_h, vae_w).unsqueeze(2),
+        }
+
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
+
+
+# ------------------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------------------
 
 # Constants copied from QwenImageEditPlusPipeline so encoding matches inference exactly.
 CONDITION_IMAGE_SIZE = 384 * 384      # area used for the text-encoder vision tokens
@@ -263,16 +363,6 @@ PROMPT_TEMPLATE_ENCODE = (
 )
 PROMPT_TEMPLATE_ENCODE_START_IDX = 64
 IMG_PROMPT_TEMPLATE = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-BOX_OUTLINE_WIDTH = 12
-
-
-def calculate_dimensions(target_area, ratio):
-    """Pick (w, h) with the given aspect ratio and ~target_area, rounded to /32."""
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-    return width, height
 
 
 def pack_latents(latents, batch_size, num_channels_latents, height, width):
@@ -308,7 +398,6 @@ def extract_masked_hidden(hidden_states, mask):
 
 
 def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, device, dtype):
-    """Replicates QwenImageEditPlusPipeline._get_qwen_prompt_embeds for a single sample."""
     base_img_prompt = ""
     for i in range(len(condition_images)):
         base_img_prompt += IMG_PROMPT_TEMPLATE.format(i + 1)
@@ -332,88 +421,34 @@ def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, de
     hidden_states = outputs.hidden_states[-1]
     split = extract_masked_hidden(hidden_states, model_inputs["attention_mask"])
     split = [e[PROMPT_TEMPLATE_ENCODE_START_IDX:] for e in split]
+
     # single sample -> no padding needed
     prompt_embeds = split[0].unsqueeze(0).to(dtype=dtype, device=device)
     prompt_embeds_mask = torch.ones(
         (1, prompt_embeds.shape[1]), dtype=torch.long, device=device
     )
+
     return prompt_embeds, prompt_embeds_mask
 
 
-def draw_condition_image(bboxes, width, height, colors, outline_width=BOX_OUTLINE_WIDTH):
-    """Black canvas with filled boxes. bboxes are normalized [cx, cy, w, h]."""
-    img = Image.new("RGB", (width, height), color="black")
-    draw = ImageDraw.Draw(img)
-    for (x, y, w, h), color in zip(bboxes, colors):
-        left = int((x - w / 2.0) * width)
-        top = int((y - h / 2.0) * height)
-        right = int((x + w / 2.0) * width)
-        bottom = int((y + h / 2.0) * height)
-        draw.rectangle(
-            [left, top, right, bottom],
-            outline=color,
-            fill=color,
-            width=outline_width,
-        )
-    return img
-
-
-def load_training_dataset(dataset_name_or_path):
-    dataset_path = Path(dataset_name_or_path)
-    if dataset_path.is_dir():
-        parquet_files = sorted(dataset_path.glob("*.parquet"))
-        if not parquet_files:
-            raise FileNotFoundError(f"No parquet files found under {dataset_path}")
-        return load_dataset("parquet", data_files=[str(p) for p in parquet_files], split="train")
-
-    dataset = load_dataset(dataset_name_or_path)
-    if hasattr(dataset, "keys") and "train" in dataset:
-        return dataset["train"]
-    return dataset
-
-
 @torch.no_grad()
-def encode_sample(row, vae, text_encoder, processor, image_processor, latent_channels, args, device, dtype):
-    """Turn one raw parquet row into the tensors a training step needs.
-
-    Returns target/condition latents already shaped ``(1, S, 64)`` (on ``device``),
-    the prompt embeddings ``(1, L, D)`` / mask ``(1, L)``, and ``img_shapes`` wrapped
-    for a batch of one.
-    """
-    objects = row["objects"]
-    bboxes = objects["bbox"]
-    names = objects.get("category_name") or [str(c) for c in objects["category"]]
-    colors = allocate_bbox_colors(len(bboxes))
-
-    img = row["image"]
-    if isinstance(img, dict):  # {"bytes":..., "path":...}
-        img = Image.open(io.BytesIO(img["bytes"]))
-    target = img.convert("RGB")
-    tw, th = target.size
-    ratio = tw / th
-
-    vae_w, vae_h = calculate_dimensions(VAE_IMAGE_SIZE, ratio)
-    cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, ratio)
-
-    # condition image (boxes), drawn at the VAE resolution then resized for the text encoder
-    cond_full = draw_condition_image(bboxes, vae_w, vae_h, colors)
-    cond_for_text = image_processor.resize(cond_full, cond_h, cond_w)
-    prompt = build_qwen_prompt(names, colors, args.qwen_prompt)
-
+def encode_sample(sample, vae, text_encoder, processor, latent_channels, device, dtype):
     # ----- prompt embeddings (depend on prompt + condition image) -----
     prompt_embeds, prompt_embeds_mask = get_qwen_prompt_embeds(
-        text_encoder, processor, prompt, [cond_for_text], device, dtype
+        text_encoder, processor, sample["prompt"], [sample["cond_for_text"]], device, dtype
     )
 
     # ----- target latents (the real photo) -----
-    target_px = image_processor.preprocess(target, vae_h, vae_w).unsqueeze(2).to(device, dtype)
-    target_lat = encode_vae_image(vae, target_px, latent_channels)  # (1,16,1,lh,lw)
+    target_lat = encode_vae_image(
+        vae, sample["target_img"].to(device, dtype), latent_channels
+    )  # (1,16,1,lh,lw)
     lh, lw = target_lat.shape[3], target_lat.shape[4]
     target_latents = pack_latents(target_lat, 1, latent_channels, lh, lw)  # (1,S,64)
 
     # ----- condition latents (box canvas) -----
-    cond_px = image_processor.preprocess(cond_full, vae_h, vae_w).unsqueeze(2).to(device, dtype)
-    cond_lat = encode_vae_image(vae, cond_px, latent_channels)
+    cond_lat = encode_vae_image(
+        vae, sample["cond_img"].to(device, dtype), latent_channels
+    )
     clh, clw = cond_lat.shape[3], cond_lat.shape[4]
     cond_latents = pack_latents(cond_lat, 1, latent_channels, clh, clw)  # (1,Sc,64)
 
@@ -426,32 +461,7 @@ def encode_sample(row, vae, text_encoder, processor, image_processor, latent_cha
         "target_latents": target_latents,          # (1, S, 64)
         "cond_latents": cond_latents,              # (1, Sc, 64)
         "img_shapes": img_shapes,
-        "prompt": prompt,
     }
-
-
-def prepare_dataset(args):
-    dataset = load_training_dataset(args.dataset_name_or_path)
-
-    # Drop rows without boxes (reads only the "objects" column, no image decode)
-    dataset = dataset.filter(lambda obj: len(obj["bbox"]) > 0, input_columns="objects")
-
-    # Randomly sample a subset if requested
-    if args.max_samples and args.max_samples > 0:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-
-    def collate_fn(examples):
-        # Each row is VAE/text-encoder encoded on the fly in the training loop
-        # (the models aren't available here), so just pass the raw rows through.
-        return examples
-
-    return torch.utils.data.DataLoader(
-        dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
 
 
 def get_sigmas(scheduler, timesteps, device, n_dim, dtype):
@@ -491,9 +501,6 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build dataset (raw rows; each is encoded on the fly in the training loop)
-    train_dataloader = prepare_dataset(args)
-
     # Load Qwen model and tokenizer
     transformer = QwenImageTransformer2DModel.from_pretrained(
         args.qwen_model, subfolder="transformer", torch_dtype=dtype
@@ -513,9 +520,12 @@ def main():
     text_encoder.requires_grad_(False)
     processor = Qwen2VLProcessor.from_pretrained(args.qwen_model, subfolder="processor")
 
-    latent_channels = vae.config.z_dim                    # 16
-    vae_scale_factor = 2 ** len(vae.temperal_downsample)  # 8
+    latent_channels = vae.config.z_dim
+    vae_scale_factor = 2 ** len(vae.temperal_downsample)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+    # Build dataset (needs image_processor for the CPU-side preprocessing in collate_fn)
+    train_dataloader = prepare_dataset(args, image_processor)
 
     # Load scheduler
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -564,6 +574,7 @@ def main():
     dataloader = {"train": train_dataloader}
     first_epoch = 0
 
+    # Initialize progress bar
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=0,
@@ -575,89 +586,104 @@ def main():
         for step, batch in enumerate(dataloader["train"]):
             if global_step >= args.max_train_steps:
                 break
+            
+            # Encode the batch of samples
+            samples = [
+                encode_sample(
+                    sample,
+                    vae=vae,
+                    text_encoder=text_encoder,
+                    processor=processor,
+                    latent_channels=latent_channels,
+                    device=device,
+                    dtype=dtype,
+                )
+                for sample in batch
+            ]
 
-            for row in batch:
+            target_latents = torch.cat([s["target_latents"] for s in samples], dim=0)   # (B,S,64)
+            cond_latents = torch.cat([s["cond_latents"] for s in samples], dim=0)       # (B,Sc,64)
+
+            bsz = len(samples)
+            max_len = max(s["prompt_embeds"].shape[1] for s in samples)
+            embed_dim = samples[0]["prompt_embeds"].shape[-1]
+            prompt_embeds = torch.zeros((bsz, max_len, embed_dim), dtype=dtype, device=device)
+            prompt_embeds_mask = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
+            for i, s in enumerate(samples):
+                length = s["prompt_embeds"].shape[1]
+                prompt_embeds[i, :length] = s["prompt_embeds"][0]
+                prompt_embeds_mask[i, :length] = s["prompt_embeds_mask"][0]
+
+            # One layer-list per batch element; all identical given the fixed image size.
+            img_shapes = [s["img_shapes"][0] for s in samples]
+
+            # Sample noise for flow-matching target
+            noise = torch.randn_like(target_latents)
+
+            # Sample a timestep per the chosen density scheme (one per batch element)
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme=args.weighting_scheme,
+                batch_size=bsz,
+                logit_mean=args.logit_mean,
+                logit_std=args.logit_std,
+                mode_scale=args.mode_scale,
+            )
+            indices = (u * num_train_timesteps).long().clamp(0, num_train_timesteps - 1)
+            timesteps = scheduler.timesteps[indices].to(device)
+
+            sigmas = get_sigmas(scheduler, timesteps, device, target_latents.ndim, dtype)
+            noisy_latents = (1.0 - sigmas) * target_latents + sigmas * noise
+
+            # Condition latents are clean and concatenated along the sequence dimension
+            model_input = torch.cat([noisy_latents, cond_latents], dim=1)
+
+            # Compute guidance if the model has guidance embeddings
+            guidance = None
+            if bool(transformer.config.guidance_embeds):
+                guidance = torch.full([bsz], 1.0, device=device, dtype=torch.float32)
+
+            autocast_device = "cuda" if device.startswith("cuda") else "cpu"
+            with torch.autocast(device_type=autocast_device, dtype=dtype, enabled=device.startswith("cuda")):
+                model_pred = transformer(
+                    hidden_states=model_input,
+                    timestep=timesteps / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    img_shapes=img_shapes,
+                    attention_kwargs={},
+                    return_dict=False,
+                )[0]
+            model_pred = model_pred[:, : target_latents.size(1)]
+
+            # flow-matching target = noise - x0; loss in fp32
+            target_v = (noise - target_latents).float()
+            weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas).float()
+            loss = (weighting * (model_pred.float() - target_v) ** 2).mean()
+
+            (loss / args.gradient_accumulation_steps).backward()
+            accum += 1
+
+            if accum == args.gradient_accumulation_steps:
+                torch.nn.utils.clip_grad_norm_(lora_params, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                accum = 0
+                global_step += 1
+                progress_bar.update(1)
+
+                if global_step % args.log_every == 0:
+                    print(
+                        f"[train] step {global_step}/{args.max_train_steps} "
+                        f"loss {loss.item():.4f} lr {lr_scheduler.get_last_lr()[0]:.2e}"
+                    )
+
+                if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
+                    save_lora(transformer, output_dir / f"checkpoint-{global_step}")
+
                 if global_step >= args.max_train_steps:
                     break
-
-                # Encode this sample on the fly (VAE + text encoder), no grad.
-                sample = encode_sample(
-                    row, vae, text_encoder, processor, image_processor,
-                    latent_channels, args, device, dtype,
-                )
-                target_latents = sample["target_latents"]          # (1,S,64)
-                cond_latents = sample["cond_latents"]              # (1,Sc,64)
-                prompt_embeds = sample["prompt_embeds"]            # (1,L,D)
-                prompt_embeds_mask = sample["prompt_embeds_mask"]  # (1,L)
-                img_shapes = sample["img_shapes"]                  # [[(..),(..)]]
-
-                bsz = target_latents.shape[0]
-                noise = torch.randn_like(target_latents)
-
-                # Sample a timestep per the chosen density scheme
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=args.weighting_scheme,
-                    batch_size=bsz,
-                    logit_mean=args.logit_mean,
-                    logit_std=args.logit_std,
-                    mode_scale=args.mode_scale,
-                )
-                indices = (u * num_train_timesteps).long().clamp(0, num_train_timesteps - 1)
-                timesteps = scheduler.timesteps[indices].to(device)
-
-                sigmas = get_sigmas(scheduler, timesteps, device, target_latents.ndim, dtype)
-                noisy_latents = (1.0 - sigmas) * target_latents + sigmas * noise
-
-                # Condition latents are clean and concatenated along the sequence dimension
-                model_input = torch.cat([noisy_latents, cond_latents], dim=1)
-
-                # Compute guidance if the model has guidance embeddings
-                guidance = None
-                if bool(transformer.config.guidance_embeds):
-                    guidance = torch.full([bsz], 1.0, device=device, dtype=torch.float32)
-
-                autocast_device = "cuda" if device.startswith("cuda") else "cpu"
-                with torch.autocast(device_type=autocast_device, dtype=dtype, enabled=device.startswith("cuda")):
-                    model_pred = transformer(
-                        hidden_states=model_input,
-                        timestep=timesteps / 1000,
-                        guidance=guidance,
-                        encoder_hidden_states=prompt_embeds,
-                        encoder_hidden_states_mask=prompt_embeds_mask,
-                        img_shapes=img_shapes,
-                        attention_kwargs={},
-                        return_dict=False,
-                    )[0]
-                model_pred = model_pred[:, : target_latents.size(1)]
-
-                # flow-matching target = noise - x0; loss in fp32
-                target_v = (noise - target_latents).float()
-                weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas).float()
-                loss = (weighting * (model_pred.float() - target_v) ** 2).mean()
-
-                (loss / args.gradient_accumulation_steps).backward()
-                accum += 1
-
-                if accum == args.gradient_accumulation_steps:
-                    torch.nn.utils.clip_grad_norm_(lora_params, args.max_grad_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    accum = 0
-                    global_step += 1
-                    progress_bar.update(1)
-
-                    if global_step % args.log_every == 0:
-                        print(
-                            f"[train] step {global_step}/{args.max_train_steps} "
-                            f"loss {loss.item():.4f} lr {lr_scheduler.get_last_lr()[0]:.2e}"
-                        )
-
-                    if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                        save_lora(transformer, output_dir / f"checkpoint-{global_step}")
-
-                    if global_step >= args.max_train_steps:
-                        break
 
         if global_step >= args.max_train_steps:
             break

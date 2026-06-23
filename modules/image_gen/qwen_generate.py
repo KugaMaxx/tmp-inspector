@@ -11,24 +11,6 @@ from diffusers import QwenImageEditPlusPipeline
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-# Palette of visually distinct colors. Each entry maps a color name to its RGB
-# value so the same name can be referenced in the Qwen prompt.
-COLOR_PALETTE = [
-    ("red",     (255, 0, 0)),
-    ("green",   (0, 200, 0)),
-    ("blue",    (0, 0, 255)),
-    ("yellow",  (255, 255, 0)),
-    ("magenta", (255, 0, 255)),
-    ("cyan",    (0, 255, 255)),
-    ("orange",  (255, 128, 0)),
-    ("purple",  (140, 0, 255)),
-    ("pink",    (255, 105, 180)),
-    ("lime",    (170, 255, 0)),
-    ("teal",    (0, 160, 160)),
-    ("brown",   (150, 75, 0)),
-]
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="AI Image Generator.")
     # GPT-2 generation settings
@@ -236,6 +218,24 @@ def extract_bboxes_from_text(output_text):
         parsed_results.append([label, [x, y, w, h]])
 
     return parsed_results
+
+
+# Palette of visually distinct colors. Each entry maps a color name to its RGB
+# value so the same name can be referenced in the Qwen prompt.
+COLOR_PALETTE = [
+    ("red",     (255, 0, 0)),
+    ("green",   (0, 200, 0)),
+    ("blue",    (0, 0, 255)),
+    ("yellow",  (255, 255, 0)),
+    ("magenta", (255, 0, 255)),
+    ("cyan",    (0, 255, 255)),
+    ("orange",  (255, 128, 0)),
+    ("purple",  (140, 0, 255)),
+    ("pink",    (255, 105, 180)),
+    ("lime",    (170, 255, 0)),
+    ("teal",    (0, 160, 160)),
+    ("brown",   (150, 75, 0)),
+]
 
 
 def allocate_bbox_colors(n):
