@@ -623,7 +623,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Build dataset (fire + aspect-ratio-matched COCO augmentation) and preprocess
+    # Build dataset and preprocess
     datasets = build_training_dataset(args)
 
     lm_datasets = datasets.map(

@@ -89,14 +89,14 @@ def parse_args():
         help="Square image resolution for condition and generated images."
     )
     parser.add_argument(
-        "--qwen_prompt_template",
+        "--qwen_prompt",
         type=str,
         default=(
             "Replace the red bounding box with {objects}. "
             "The placeholder {objects} must only appear within the red box and match the box in dimensions. "
             "A real-scene background shall be adopted."
         ),
-        help="Template for image generation prompt.",
+        help="Per-bbox template for image generation prompt.",
     )
     parser.add_argument(
         "--qwen_negative_prompt",
