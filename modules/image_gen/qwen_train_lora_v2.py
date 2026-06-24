@@ -1,8 +1,10 @@
 import math
 import random
+import logging
 import argparse
 from tqdm import tqdm
 from pathlib import Path
+from datetime import datetime
 
 from PIL import Image, ImageDraw
 
@@ -30,6 +32,9 @@ from transformers import (
     Qwen2VLProcessor,
 )
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -528,7 +533,7 @@ def init_trackers(args):
             from torch.utils.tensorboard import SummaryWriter
             trackers["tensorboard"] = SummaryWriter(log_dir=str(Path(args.output_dir) / "logs"))
         except ImportError:
-            print("[validation] tensorboard requested but not installed; skipping.")
+            logger.warning("[validation] tensorboard requested but not installed; skipping.")
 
     if "wandb" in report_to:
         try:
@@ -540,7 +545,7 @@ def init_trackers(args):
             )
             trackers["wandb"] = wandb
         except ImportError:
-            print("[validation] wandb requested but not installed; skipping.")
+            logger.warning("[validation] wandb requested but not installed; skipping.")
 
     return trackers
 
@@ -550,9 +555,12 @@ def log_validation(args, pipeline, trackers, dataloader, global_step, device):
     if not trackers:
         return
 
+    logger.info(f"[validation] running validation at step {global_step}...")
+
     transformer = pipeline.transformer
     was_training = transformer.training
     transformer.eval()
+    pipeline.set_progress_bar_config(disable=True)
 
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -637,7 +645,7 @@ def save_checkpoint(args, transformer, optimizer, lr_scheduler, global_step, epo
         },
         ckpt_dir / "training_state.pt",
     )
-    print(f"[checkpoint] saved state to {ckpt_dir}")
+    logger.info(f"[checkpoint] saved state to {ckpt_dir}")
 
     _prune_checkpoints(args)
     return ckpt_dir
@@ -658,8 +666,8 @@ def _prune_checkpoints(args):
     to_remove = checkpoints[: len(checkpoints) - args.checkpoints_total_limit]
     for ckpt in to_remove:
         shutil.rmtree(ckpt, ignore_errors=True)
-    print(f"[checkpoint] pruned {len(to_remove)} old checkpoint(s): "
-          f"{', '.join(p.name for p in to_remove)}")
+    logger.info(f"[checkpoint] pruned {len(to_remove)} old checkpoint(s): "
+                f"{', '.join(p.name for p in to_remove)}")
 
 
 def load_checkpoint(args, transformer, optimizer, lr_scheduler):
@@ -669,10 +677,10 @@ def load_checkpoint(args, transformer, optimizer, lr_scheduler):
 
     state_path = ckpt_dir / "training_state.pt"
     if not state_path.exists():
-        print(f"[checkpoint] {state_path} not found; starting from scratch.")
+        logger.info(f"[checkpoint] {state_path} not found; starting from scratch.")
         return 0, 0
 
-    print(f"[checkpoint] resuming from {ckpt_dir}")
+    logger.info(f"[checkpoint] resuming from {ckpt_dir}")
     state = torch.load(state_path, map_location="cpu", weights_only=False)
 
     # LoRA weights -> peft adapters (must already be added on `transformer`)
@@ -686,7 +694,7 @@ def load_checkpoint(args, transformer, optimizer, lr_scheduler):
 
     global_step = int(state["global_step"])
     epoch = int(state["epoch"])
-    print(f"[checkpoint] resumed at step {global_step} (epoch {epoch})")
+    logger.info(f"[checkpoint] resumed at step {global_step} (epoch {epoch})")
     return global_step, epoch
 
 
@@ -701,15 +709,15 @@ def _resolve_checkpoint_path(args):
             key=lambda p: int(p.name.split("-")[-1]),
         )
         if not checkpoints:
-            print("[checkpoint] --resume_from_checkpoint=latest but no checkpoint found; "
-                  "starting from scratch.")
+            logger.info("[checkpoint] --resume_from_checkpoint=latest but no checkpoint found; "
+                        "starting from scratch.")
             return None
         return checkpoints[-1]
 
     path = Path(resume)
     if not path.exists():
-        print(f"[checkpoint] --resume_from_checkpoint={resume} does not exist; "
-              "starting from scratch.")
+        logger.info(f"[checkpoint] --resume_from_checkpoint={resume} does not exist; "
+                    "starting from scratch.")
         return None
     return path
 
@@ -744,6 +752,20 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set logging
+    logging_dir = output_dir / "logs"
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[
+            logging.FileHandler(logging_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
+        ],
+    )
+    logger.info(f"[train] Starting script: {Path(__file__).name}")
+
     # Load Qwen model and tokenizer
     transformer = QwenImageTransformer2DModel.from_pretrained(
         args.qwen_model, subfolder="transformer", torch_dtype=dtype
@@ -767,6 +789,10 @@ def main():
     latent_channels = vae.config.z_dim
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
+
+    # Logging configuration and model details
+    logger.info(f"[train] Training Arguments: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(args).items()])} \n")
+    logger.info(f"[train] Model Config: \n {transformer.config}")
 
     # Build dataset
     dataloader = prepare_dataset(args)
@@ -842,17 +868,10 @@ def main():
         desc="Steps",
     )
 
-    log_validation(
-        args,
-        pipeline=pipeline,
-        trackers=trackers,
-        dataloader=dataloader,
-        global_step=global_step,
-        device=device,
-    )
-
     # Training loop
     for epoch in range(first_epoch, args.num_train_epochs):
+        logger.info(f"[train] Starting epoch {epoch + 1}/{args.num_train_epochs}...")
+
         for step, batch in enumerate(dataloader["train"]):
             if global_step >= args.max_train_steps:
                 break
@@ -950,8 +969,8 @@ def main():
                 progress_bar.update(1)
 
                 if global_step % args.log_every == 0:
-                    print(
-                        f"[train] step {global_step}/{args.max_train_steps} "
+                    logger.info(
+                        f"[train] step {global_step}/{args.max_train_steps} | "
                         f"loss {loss.item():.4f} lr {lr_scheduler.get_last_lr()[0]:.2e}"
                     )
 
@@ -992,6 +1011,8 @@ def main():
 
     if "wandb" in trackers:
         trackers["wandb"].finish()
+
+    logger.info(f"[train] finished training at step {global_step}. LoRA weights saved to {output_dir}")
 
 
 if __name__ == "__main__":
