@@ -48,9 +48,17 @@ def parse_args():
         "--qwen_prompt",
         type=str,
         default=(
+            "Replace the black background with a coherent real-world scene."
+        ),
+        help="Global scene instruction prepended once before the per-bbox object prompts.",
+    )
+    parser.add_argument(
+        "--qwen_additional_prompt",
+        type=str,
+        default=(
             "Replace the {color} masked region with {objects}."
         ),
-        help="Per-bbox template for image generation prompt.",
+        help="Per-bbox template for the object placed in each masked region.",
     )
     parser.add_argument(
         "--qwen_negative_prompt",
@@ -71,7 +79,7 @@ def parse_args():
     parser.add_argument(
         "--max_samples",
         type=int,
-        default=10,
+        default=0,
         help="Maximum number of samples to use from the dataset (0 for all samples)."
     )
 
@@ -109,7 +117,7 @@ def parse_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
         help="Random seed for reproducibility"
     )
     parser.add_argument(
@@ -121,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size",
         type=int, 
-        default=1, 
+        default=4, 
         help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
@@ -145,7 +153,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=6,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -155,7 +163,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-5,
+        default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -188,7 +196,7 @@ def parse_args():
     parser.add_argument(
         "--log_every",
         type=int,
-        default=1,
+        default=100,
         help="Print training logs every N optimizer steps.",
     )
 
@@ -206,9 +214,16 @@ def parse_args():
 
     # Validation
     parser.add_argument(
+        "--validation_ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help=("A set of validation data evaluated every `--validation_steps`."),
+    )
+    parser.add_argument(
         "--validation_steps",
         type=int,
-        default=None,
+        default=100,
         help="Run validation every X steps.",
     )
     parser.add_argument(
@@ -291,7 +306,6 @@ def allocate_bbox_colors(n):
 
 
 def calculate_dimensions(target_area, ratio):
-    """Pick (w, h) with the given aspect ratio and ~target_area, rounded to /32."""
     width = math.sqrt(target_area * ratio)
     height = width / ratio
     width = round(width / 32) * 32
@@ -317,7 +331,7 @@ def draw_condition_image(bboxes, width, height, colors, alpha=64):
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
-def prepare_dataset(args, image_processor):
+def prepare_dataset(args):
     # Load the dataset
     dataset = load_dataset(args.dataset_name_or_path)
 
@@ -328,38 +342,38 @@ def prepare_dataset(args, image_processor):
     if args.max_samples and args.max_samples > 0:
         dataset['train'] = dataset['train'].select(range(min(args.max_samples, len(dataset['train']))))
 
+    # Extract a subset for efficient validation
+    if args.validation_ids is not None:
+        dataset["validation"] = dataset["validation"].select(args.validation_ids)
+
     def process(example):
         bboxes = example["objects"].get("bbox")
         labels = example["objects"].get("category_name")
         bboxes = [(label, bbox) for label, bbox in zip(labels, bboxes)]
         colors = allocate_bbox_colors(len(bboxes))
 
-        target = example["image"].convert("RGB")
-        tw, th = target.size
+        target_image = example["image"].convert("RGB")
+        tw, th = target_image.size
         ratio = tw / th
 
+        # Build condition image
         vae_w, vae_h = calculate_dimensions(VAE_IMAGE_SIZE, ratio)
-        cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, ratio)
-
-        # Build condition image, drawn at the VAE resolution then resized for the text encoder
-        cond_image_full = draw_condition_image(bboxes, vae_w, vae_h, colors)
-        cond_image_small = image_processor.resize(cond_image_full, cond_h, cond_w)
+        cond_image = draw_condition_image(bboxes, vae_w, vae_h, colors)
 
         # Build qwen prompt
-        qwen_prompt = " ".join(
-            args.qwen_prompt.format(
+        qwen_addtional_prompt = " ".join(
+            args.qwen_additional_prompt.format(
                 objects=label,
                 color=color,
             )
             for (label, bbox), (color, rgb) in zip(bboxes, colors)
         )
+        qwen_prompt = f"{args.qwen_prompt} {qwen_addtional_prompt}"
 
         return {
             "prompt": qwen_prompt,
-            "cond_image_small": cond_image_small,
-            "cond_image_full": cond_image_full,
-            "target_tensor": image_processor.preprocess(target, vae_h, vae_w).unsqueeze(2),
-            "cond_tensor": image_processor.preprocess(cond_image_full, vae_h, vae_w).unsqueeze(2),
+            "cond_image": cond_image,
+            "target_image": target_image,
         }
 
     def collate_fn(examples):
@@ -370,9 +384,9 @@ def prepare_dataset(args, image_processor):
     for dataset_part in dataset.keys():
         dataloader[dataset_part] = torch.utils.data.DataLoader(
             dataset[dataset_part],
-            shuffle=True,
+            shuffle=True if dataset_part == 'train' else False,
             collate_fn=collate_fn,
-            batch_size=args.train_batch_size,
+            batch_size=args.train_batch_size if dataset_part == 'train' else 1,
             num_workers=args.dataloader_num_workers,
         )
 
@@ -397,16 +411,14 @@ PROMPT_TEMPLATE_ENCODE_START_IDX = 64
 IMG_PROMPT_TEMPLATE = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 
 
-def pack_latents(latents, batch_size, num_channels_latents, height, width):
-    """Turn (B, C, h, w) VAE latents into (B, h/2 * w/2, C*4) patch tokens."""
+def _pack_latents(latents, batch_size, num_channels_latents, height, width):
     latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
     latents = latents.permute(0, 2, 4, 1, 3, 5)
     latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
     return latents
 
 
-def encode_vae_image(vae, image, latent_channels):
-    """VAE-encode a (B, C, 1, H, W) pixel tensor and normalize, matching the pipeline."""
+def _encode_vae_image(vae, image, latent_channels):
     image_latents = vae.encode(image).latent_dist.mode()  # deterministic (sample_mode="argmax")
     latents_mean = (
         torch.tensor(vae.config.latents_mean)
@@ -422,14 +434,14 @@ def encode_vae_image(vae, image, latent_channels):
     return image_latents
 
 
-def extract_masked_hidden(hidden_states, mask):
+def _extract_masked_hidden(hidden_states, mask):
     bool_mask = mask.bool()
     valid_lengths = bool_mask.sum(dim=1)
     selected = hidden_states[bool_mask]
     return torch.split(selected, valid_lengths.tolist(), dim=0)
 
 
-def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, device, dtype):
+def _get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, device, dtype):
     base_img_prompt = ""
     for i in range(len(condition_images)):
         base_img_prompt += IMG_PROMPT_TEMPLATE.format(i + 1)
@@ -451,7 +463,7 @@ def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, de
     )
 
     hidden_states = outputs.hidden_states[-1]
-    split = extract_masked_hidden(hidden_states, model_inputs["attention_mask"])
+    split = _extract_masked_hidden(hidden_states, model_inputs["attention_mask"])
     split = [e[PROMPT_TEMPLATE_ENCODE_START_IDX:] for e in split]
 
     # single sample -> no padding needed
@@ -464,25 +476,32 @@ def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, de
 
 
 @torch.no_grad()
-def encode_sample(sample, vae, text_encoder, processor, latent_channels, device, dtype):
-    # ----- prompt embeddings (depend on prompt + condition image) -----
-    prompt_embeds, prompt_embeds_mask = get_qwen_prompt_embeds(
-        text_encoder, processor, sample["prompt"], [sample["cond_image_small"]], device, dtype
+def encode_sample(sample, vae, text_encoder, processor, image_processor, latent_channels, device, dtype):
+    # ----- prompt embeddings -----
+    cond_image = sample["cond_image"]
+    vae_w, vae_h = cond_image.width, cond_image.height
+    cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, vae_w / vae_h)
+    cond_image_resized = image_processor.resize(cond_image, cond_h, cond_w)
+    prompt_embeds, prompt_embeds_mask = _get_qwen_prompt_embeds(
+        text_encoder, processor, sample["prompt"], [cond_image_resized], device, dtype
     )
 
-    # ----- target latents (the real photo) -----
-    target_lat = encode_vae_image(
-        vae, sample["target_tensor"].to(device, dtype), latent_channels
-    )  # (1,16,1,lh,lw)
+    # ----- target latents -----
+    target_image = sample["target_image"]
+    target_tensor = image_processor.preprocess(target_image, vae_h, vae_w).unsqueeze(2)
+    target_lat = _encode_vae_image(
+        vae, target_tensor.to(device, dtype), latent_channels
+    )
     lh, lw = target_lat.shape[3], target_lat.shape[4]
-    target_latents = pack_latents(target_lat, 1, latent_channels, lh, lw)  # (1,S,64)
+    target_latents = _pack_latents(target_lat, 1, latent_channels, lh, lw)
 
-    # ----- condition latents (box canvas) -----
-    cond_lat = encode_vae_image(
-        vae, sample["cond_tensor"].to(device, dtype), latent_channels
+    # ----- condition latents -----
+    cond_tensor = image_processor.preprocess(cond_image, vae_h, vae_w).unsqueeze(2)
+    cond_lat = _encode_vae_image(
+        vae, cond_tensor.to(device, dtype), latent_channels
     )
     clh, clw = cond_lat.shape[3], cond_lat.shape[4]
-    cond_latents = pack_latents(cond_lat, 1, latent_channels, clh, clw)  # (1,Sc,64)
+    cond_latents = _pack_latents(cond_lat, 1, latent_channels, clh, clw)
 
     # img_shapes: (frames, grid_h, grid_w) for target then condition, wrapped for batch=1
     img_shapes = [[(1, lh // 2, lw // 2), (1, clh // 2, clw // 2)]]
@@ -538,25 +557,33 @@ def log_validation(args, pipeline, trackers, dataloader, global_step, device):
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
-    images, captions = [], []
+    log_images, captions = [], []
     autocast_device = "cuda" if device.startswith("cuda") else "cpu"
     for i, sample in enumerate(dataloader["validation"]):
+        cond_image = sample[0]["cond_image"]
         with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=device.startswith("cuda")):
             image = pipeline(
-                image=[sample["cond_image_full"]],
-                prompt=sample["prompt"],
+                image=[cond_image],
+                prompt=sample[0]["prompt"],
                 negative_prompt=args.qwen_negative_prompt,
                 num_inference_steps=args.validation_num_inference_steps,
                 true_cfg_scale=args.validation_cfg_scale,
-                generator=torch.Generator(device="cpu").manual_seed(args.seed + i if args.seed is not None else i),
+                generator=torch.Generator(device="cpu").manual_seed(args.seed) if args.seed else None,
             ).images[0]
-        images.append(image)
-        captions.append(sample["prompt"])
+
+        # Combine the condition image and generated image
+        w, h = cond_image.size
+        combined_image = Image.new("RGB", (w * 2, h))
+        combined_image.paste(cond_image.convert("RGB"), (0, 0))
+        combined_image.paste(image.convert("RGB"), (w, 0))
+        
+        log_images.append(combined_image)
+        captions.append(sample[0]["prompt"])
     
     if "tensorboard" in trackers:
         import numpy as np
         writer = trackers["tensorboard"]
-        for i, image in enumerate(images):
+        for i, image in enumerate(log_images):
             arr = np.asarray(image.convert("RGB"))  # (H, W, C)
             writer.add_image(f"validation/sample_{i}", arr, global_step, dataformats="HWC")
     
@@ -566,7 +593,7 @@ def log_validation(args, pipeline, trackers, dataloader, global_step, device):
             {
                 "validation": [
                     wandb.Image(image, caption=caption)
-                    for image, caption in zip(images, captions)
+                    for image, caption in zip(log_images, captions)
                 ]
             },
             step=global_step,
@@ -664,7 +691,6 @@ def load_checkpoint(args, transformer, optimizer, lr_scheduler):
 
 
 def _resolve_checkpoint_path(args):
-    """Resolve --resume_from_checkpoint ('latest' or an explicit path) to a directory."""
     resume = args.resume_from_checkpoint
     if resume is None:
         return None
@@ -742,8 +768,8 @@ def main():
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
-    # Build dataset (needs image_processor for the CPU-side preprocessing in collate_fn)
-    dataloader = prepare_dataset(args, image_processor)
+    # Build dataset
+    dataloader = prepare_dataset(args)
 
     # Load scheduler
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -816,6 +842,15 @@ def main():
         desc="Steps",
     )
 
+    log_validation(
+        args,
+        pipeline=pipeline,
+        trackers=trackers,
+        dataloader=dataloader,
+        global_step=global_step,
+        device=device,
+    )
+
     # Training loop
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(dataloader["train"]):
@@ -833,6 +868,7 @@ def main():
                     vae=vae,
                     text_encoder=text_encoder,
                     processor=processor,
+                    image_processor=image_processor,
                     latent_channels=latent_channels,
                     device=device,
                     dtype=dtype,
