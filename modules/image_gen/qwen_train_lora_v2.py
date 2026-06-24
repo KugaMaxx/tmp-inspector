@@ -14,6 +14,7 @@ from diffusers import (
     AutoencoderKLQwenImage,
     QwenImageTransformer2DModel,
     FlowMatchEulerDiscreteScheduler,
+    QwenImageEditPlusPipeline,
 )
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import QwenImageLoraLoaderMixin
@@ -28,7 +29,7 @@ from transformers import (
     Qwen2Tokenizer,
     Qwen2VLProcessor,
 )
-from peft import LoraConfig, get_peft_model_state_dict
+from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 
 
 def parse_args():
@@ -94,6 +95,14 @@ def parse_args():
         default=["to_q", "to_k", "to_v", "to_out.0",
                   "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out"],
         help="List of target modules in the Qwen model to apply LoRA adapters."
+    )
+
+    # Directories       
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="/home/23132798r/workspace/tmp-inspector/outputs/qwen-gligen-lora-tmp",
+        help="Directory to save LoRA adapters and training logs."
     )
 
     # Training
@@ -177,15 +186,9 @@ def parse_args():
         help="Gradient clipping norm.",
     )
     parser.add_argument(
-        "--checkpointing_steps",
-        type=int,
-        default=0,
-        help="Save a checkpoint every N optimizer steps. 0 disables checkpointing.",
-    )
-    parser.add_argument(
         "--log_every",
         type=int,
-        default=10,
+        default=1,
         help="Print training logs every N optimizer steps.",
     )
 
@@ -201,12 +204,30 @@ def parse_args():
     parser.add_argument("--logit_std", type=float, default=1.0)
     parser.add_argument("--mode_scale", type=float, default=1.29)
 
-    # Directories       
+    # Validation
     parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/home/23132798r/workspace/tmp-inspector/outputs/qwen-gligen-lora-tmp",
-        help="Directory to save LoRA adapters and training logs."
+        "--validation_steps",
+        type=int,
+        default=None,
+        help="Run validation every X steps.",
+    )
+    parser.add_argument(
+        "--validation_num_inference_steps",
+        type=int,
+        default=40,
+        help="Denoising steps used for validation image generation.",
+    )
+    parser.add_argument(
+        "--validation_cfg_scale",
+        type=float,
+        default=4.0,
+        help="True CFG scale used for validation image generation.",
+    )
+    parser.add_argument(
+        "--report_to",
+        nargs="+",
+        default=["tensorboard", "wandb"],
+        help="Comma separated tracking backends: none, tensorboard, wandb"
     )
 
     # Checkpointing
@@ -215,15 +236,18 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
-            " training using `--resume_from_checkpoint`."
+            "Save a checkpoint of the training state every X updates. 0 disables checkpointing. "
+            "These checkpoints are only suitable for resuming training using `--resume_from_checkpoint`. "
         ),
     )
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
         default=None,
-        help=("Max number of checkpoints to store."),
+        help=(
+            "Max number of checkpoints to store. "
+            "None means no checkpoints, 0 means keep all. "
+        ),
     )
     parser.add_argument(
         "--resume_from_checkpoint",
@@ -234,7 +258,7 @@ def parse_args():
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
-    
+
     return parser.parse_args()
 
 
@@ -243,18 +267,18 @@ def parse_args():
 # ------------------------------------------------------------------------------
 
 COLOR_PALETTE = [
-    "red",
-    "green",
-    "blue",
-    "yellow",
-    "magenta",
-    "cyan",
-    "orange",
-    "purple",
-    "pink",
-    "lime",
-    "teal",
-    "brown",
+    ("red",     (255,   0,   0)),
+    ("green",   (  0, 128,   0)),
+    ("blue",    (  0,   0, 255)),
+    ("yellow",  (255, 255,   0)),
+    ("magenta", (255,   0, 255)),
+    ("cyan",    (  0, 255, 255)),
+    ("orange",  (255, 165,   0)),
+    ("purple",  (128,   0, 128)),
+    ("pink",    (255, 192, 203)),
+    ("lime",    (  0, 255,   0)),
+    ("teal",    (  0, 128, 128)),
+    ("brown",   (165,  42,  42)),
 ]
 
 
@@ -295,16 +319,16 @@ def draw_condition_image(bboxes, width, height, colors, alpha=64):
 
 def prepare_dataset(args, image_processor):
     # Load the dataset
-    dataset = load_dataset(args.dataset_name_or_path, split="train")
+    dataset = load_dataset(args.dataset_name_or_path)
 
     # Drop rows without boxes
     dataset = dataset.filter(lambda obj: len(obj["bbox"]) > 0, input_columns="objects")
 
     # Randomly sample a subset if requested
     if args.max_samples and args.max_samples > 0:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+        dataset['train'] = dataset['train'].select(range(min(args.max_samples, len(dataset['train']))))
 
-    def collate_fn(example):
+    def process(example):
         bboxes = example["objects"].get("bbox")
         labels = example["objects"].get("category_name")
         bboxes = [(label, bbox) for label, bbox in zip(labels, bboxes)]
@@ -318,13 +342,13 @@ def prepare_dataset(args, image_processor):
         cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, ratio)
 
         # Build condition image, drawn at the VAE resolution then resized for the text encoder
-        cond_full = draw_condition_image(bboxes, vae_w, vae_h, colors)
-        cond_for_text = image_processor.resize(cond_full, cond_h, cond_w)
+        cond_image_full = draw_condition_image(bboxes, vae_w, vae_h, colors)
+        cond_image_small = image_processor.resize(cond_image_full, cond_h, cond_w)
 
         # Build qwen prompt
         qwen_prompt = " ".join(
             args.qwen_prompt.format(
-                objects=label.split(",")[1].strip(),
+                objects=label,
                 color=color,
             )
             for (label, bbox), (color, rgb) in zip(bboxes, colors)
@@ -332,19 +356,27 @@ def prepare_dataset(args, image_processor):
 
         return {
             "prompt": qwen_prompt,
-            "cond_for_text": cond_for_text,
-            "target_img": image_processor.preprocess(target, vae_h, vae_w).unsqueeze(2),
-            "cond_img": image_processor.preprocess(cond_full, vae_h, vae_w).unsqueeze(2),
+            "cond_image_small": cond_image_small,
+            "cond_image_full": cond_image_full,
+            "target_tensor": image_processor.preprocess(target, vae_h, vae_w).unsqueeze(2),
+            "cond_tensor": image_processor.preprocess(cond_image_full, vae_h, vae_w).unsqueeze(2),
         }
 
+    def collate_fn(examples):
+        # DataLoader hands collate_fn a list of dataset rows (the batch).
+        return [process(example) for example in examples]
 
-    return torch.utils.data.DataLoader(
-        dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
+    dataloader = {}
+    for dataset_part in dataset.keys():
+        dataloader[dataset_part] = torch.utils.data.DataLoader(
+            dataset[dataset_part],
+            shuffle=True,
+            collate_fn=collate_fn,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
+
+    return dataloader
 
 
 # ------------------------------------------------------------------------------
@@ -435,19 +467,19 @@ def get_qwen_prompt_embeds(text_encoder, processor, prompt, condition_images, de
 def encode_sample(sample, vae, text_encoder, processor, latent_channels, device, dtype):
     # ----- prompt embeddings (depend on prompt + condition image) -----
     prompt_embeds, prompt_embeds_mask = get_qwen_prompt_embeds(
-        text_encoder, processor, sample["prompt"], [sample["cond_for_text"]], device, dtype
+        text_encoder, processor, sample["prompt"], [sample["cond_image_small"]], device, dtype
     )
 
     # ----- target latents (the real photo) -----
     target_lat = encode_vae_image(
-        vae, sample["target_img"].to(device, dtype), latent_channels
+        vae, sample["target_tensor"].to(device, dtype), latent_channels
     )  # (1,16,1,lh,lw)
     lh, lw = target_lat.shape[3], target_lat.shape[4]
     target_latents = pack_latents(target_lat, 1, latent_channels, lh, lw)  # (1,S,64)
 
     # ----- condition latents (box canvas) -----
     cond_lat = encode_vae_image(
-        vae, sample["cond_img"].to(device, dtype), latent_channels
+        vae, sample["cond_tensor"].to(device, dtype), latent_channels
     )
     clh, clw = cond_lat.shape[3], cond_lat.shape[4]
     cond_latents = pack_latents(cond_lat, 1, latent_channels, clh, clw)  # (1,Sc,64)
@@ -464,6 +496,202 @@ def encode_sample(sample, vae, text_encoder, processor, latent_channels, device,
     }
 
 
+# ------------------------------------------------------------------------------
+# Validation
+# ------------------------------------------------------------------------------
+
+def init_trackers(args):
+    trackers = {}
+    report_to = [b for b in (args.report_to or []) if b and b != "none"]
+
+    if "tensorboard" in report_to:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            trackers["tensorboard"] = SummaryWriter(log_dir=str(Path(args.output_dir) / "logs"))
+        except ImportError:
+            print("[validation] tensorboard requested but not installed; skipping.")
+
+    if "wandb" in report_to:
+        try:
+            import wandb
+            wandb.init(
+                project="qwen-gligen-lora",
+                dir=str(args.output_dir),
+                config=vars(args),
+            )
+            trackers["wandb"] = wandb
+        except ImportError:
+            print("[validation] wandb requested but not installed; skipping.")
+
+    return trackers
+
+
+@torch.no_grad()
+def log_validation(args, pipeline, trackers, dataloader, global_step, device):
+    if not trackers:
+        return
+
+    transformer = pipeline.transformer
+    was_training = transformer.training
+    transformer.eval()
+
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    images, captions = [], []
+    autocast_device = "cuda" if device.startswith("cuda") else "cpu"
+    for i, sample in enumerate(dataloader["validation"]):
+        with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            image = pipeline(
+                image=[sample["cond_image_full"]],
+                prompt=sample["prompt"],
+                negative_prompt=args.qwen_negative_prompt,
+                num_inference_steps=args.validation_num_inference_steps,
+                true_cfg_scale=args.validation_cfg_scale,
+                generator=torch.Generator(device="cpu").manual_seed(args.seed + i if args.seed is not None else i),
+            ).images[0]
+        images.append(image)
+        captions.append(sample["prompt"])
+    
+    if "tensorboard" in trackers:
+        import numpy as np
+        writer = trackers["tensorboard"]
+        for i, image in enumerate(images):
+            arr = np.asarray(image.convert("RGB"))  # (H, W, C)
+            writer.add_image(f"validation/sample_{i}", arr, global_step, dataformats="HWC")
+    
+    if "wandb" in trackers:
+        wandb = trackers["wandb"]
+        wandb.log(
+            {
+                "validation": [
+                    wandb.Image(image, caption=caption)
+                    for image, caption in zip(images, captions)
+                ]
+            },
+            step=global_step,
+        )
+
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+    if was_training:
+        transformer.train()
+
+
+# ------------------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------------------
+
+def save_checkpoint(args, transformer, optimizer, lr_scheduler, global_step, epoch):
+    if args.checkpoints_total_limit is None:
+        return
+
+    # Create checkpoint directory
+    ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save LoRA weights
+    lora_state = get_peft_model_state_dict(transformer)
+    QwenImageLoraLoaderMixin.save_lora_weights(
+        save_directory=str(ckpt_dir),
+        transformer_lora_layers=lora_state,
+        safe_serialization=True,
+    )
+
+    # Resumable training state.
+    torch.save(
+        {
+            "global_step": global_step,
+            "epoch": epoch,
+            "lora_state_dict": get_peft_model_state_dict(transformer),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+        },
+        ckpt_dir / "training_state.pt",
+    )
+    print(f"[checkpoint] saved state to {ckpt_dir}")
+
+    _prune_checkpoints(args)
+    return ckpt_dir
+
+
+def _prune_checkpoints(args):
+    if args.checkpoints_total_limit <= 0:
+        return
+
+    checkpoints = sorted(
+        Path(args.output_dir).glob("checkpoint-*"),
+        key=lambda p: int(p.name.split("-")[-1]),
+    )
+    if len(checkpoints) <= args.checkpoints_total_limit:
+        return
+
+    import shutil
+    to_remove = checkpoints[: len(checkpoints) - args.checkpoints_total_limit]
+    for ckpt in to_remove:
+        shutil.rmtree(ckpt, ignore_errors=True)
+    print(f"[checkpoint] pruned {len(to_remove)} old checkpoint(s): "
+          f"{', '.join(p.name for p in to_remove)}")
+
+
+def load_checkpoint(args, transformer, optimizer, lr_scheduler):
+    ckpt_dir = _resolve_checkpoint_path(args)
+    if ckpt_dir is None:
+        return 0, 0
+
+    state_path = ckpt_dir / "training_state.pt"
+    if not state_path.exists():
+        print(f"[checkpoint] {state_path} not found; starting from scratch.")
+        return 0, 0
+
+    print(f"[checkpoint] resuming from {ckpt_dir}")
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+
+    # LoRA weights -> peft adapters (must already be added on `transformer`)
+    set_peft_model_state_dict(transformer, state["lora_state_dict"])
+
+    # Keep LoRA params in fp32, matching the fresh-init path
+    cast_training_params([transformer], dtype=torch.float32)
+
+    optimizer.load_state_dict(state["optimizer"])
+    lr_scheduler.load_state_dict(state["lr_scheduler"])
+
+    global_step = int(state["global_step"])
+    epoch = int(state["epoch"])
+    print(f"[checkpoint] resumed at step {global_step} (epoch {epoch})")
+    return global_step, epoch
+
+
+def _resolve_checkpoint_path(args):
+    """Resolve --resume_from_checkpoint ('latest' or an explicit path) to a directory."""
+    resume = args.resume_from_checkpoint
+    if resume is None:
+        return None
+
+    if resume == "latest":
+        checkpoints = sorted(
+            Path(args.output_dir).glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[-1]),
+        )
+        if not checkpoints:
+            print("[checkpoint] --resume_from_checkpoint=latest but no checkpoint found; "
+                  "starting from scratch.")
+            return None
+        return checkpoints[-1]
+
+    path = Path(resume)
+    if not path.exists():
+        print(f"[checkpoint] --resume_from_checkpoint={resume} does not exist; "
+              "starting from scratch.")
+        return None
+    return path
+
+
+# ------------------------------------------------------------------------------
+# Others
+# ------------------------------------------------------------------------------
+
 def get_sigmas(scheduler, timesteps, device, n_dim, dtype):
     sigmas = scheduler.sigmas.to(device=device, dtype=dtype)
     schedule_timesteps = scheduler.timesteps.to(device)
@@ -473,17 +701,6 @@ def get_sigmas(scheduler, timesteps, device, n_dim, dtype):
     while len(sigma.shape) < n_dim:
         sigma = sigma.unsqueeze(-1)
     return sigma
-
-
-def save_lora(transformer, save_dir):
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    lora_state = get_peft_model_state_dict(transformer)
-    QwenImageLoraLoaderMixin.save_lora_weights(
-        save_directory=str(save_dir),
-        transformer_lora_layers=lora_state,
-        safe_serialization=True,
-    )
 
 
 def main():
@@ -519,13 +736,14 @@ def main():
     ).to(device).eval()
     text_encoder.requires_grad_(False)
     processor = Qwen2VLProcessor.from_pretrained(args.qwen_model, subfolder="processor")
+    tokenizer = Qwen2Tokenizer.from_pretrained(args.qwen_model, subfolder="tokenizer")
 
     latent_channels = vae.config.z_dim
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     # Build dataset (needs image_processor for the CPU-side preprocessing in collate_fn)
-    train_dataloader = prepare_dataset(args, image_processor)
+    dataloader = prepare_dataset(args, image_processor)
 
     # Load scheduler
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -547,11 +765,9 @@ def main():
     lora_params = [p for p in transformer.parameters() if p.requires_grad]
 
     # Preprocess scheduler
+    num_steps_per_epoch = len(dataloader["train"]) // args.gradient_accumulation_steps
     if args.max_train_steps is None:
-        args.max_train_steps = max(
-            1,
-            len(train_dataloader) * args.num_train_epochs // args.gradient_accumulation_steps,
-        )
+        args.max_train_steps = max(1, args.num_train_epochs * num_steps_per_epoch)
 
     # Setup optimizer
     optimizer = torch.optim.AdamW(
@@ -568,16 +784,35 @@ def main():
 
     # Setup training loop
     transformer.train()
-    global_step = 0
-    accum = 0
     optimizer.zero_grad(set_to_none=True)
-    dataloader = {"train": train_dataloader}
-    first_epoch = 0
+
+    # Check if checkpointing steps and validation steps are set, otherwise use default values
+    args.validation_steps    = args.validation_steps if args.validation_steps else num_steps_per_epoch
+    args.checkpointing_steps = args.checkpointing_steps if args.checkpointing_steps else num_steps_per_epoch
+
+    # Resume from checkpoint if requested
+    global_step, first_epoch = load_checkpoint(args, transformer, optimizer, lr_scheduler)
+    accum = 0  # gradient-accumulation counter; checkpoints land on update boundaries, so this resets to 0
+
+    # When resuming mid-epoch, skip the optimizer steps already completed in `first_epoch`
+    completed_steps_in_epoch = global_step - first_epoch * num_steps_per_epoch
+    resume_step = completed_steps_in_epoch * args.gradient_accumulation_steps
+
+    # Setup validation trackers
+    trackers = init_trackers(args)
+    pipeline = QwenImageEditPlusPipeline(
+        scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler.config),
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        processor=processor,
+        transformer=transformer,
+    )
 
     # Initialize progress bar
     progress_bar = tqdm(
         range(0, args.max_train_steps),
-        initial=0,
+        initial=global_step,
         desc="Steps",
     )
 
@@ -586,7 +821,11 @@ def main():
         for step, batch in enumerate(dataloader["train"]):
             if global_step >= args.max_train_steps:
                 break
-            
+
+            # Skip batches already processed before the resume point (only in the first epoch).
+            if epoch == first_epoch and step < resume_step:
+                continue
+
             # Encode the batch of samples
             samples = [
                 encode_sample(
@@ -600,9 +839,10 @@ def main():
                 )
                 for sample in batch
             ]
-
+            
+            # Concatenate for the batch
             target_latents = torch.cat([s["target_latents"] for s in samples], dim=0)   # (B,S,64)
-            cond_latents = torch.cat([s["cond_latents"] for s in samples], dim=0)       # (B,Sc,64)
+            cond_latents   = torch.cat([s["cond_latents"] for s in samples],   dim=0)   # (B,Sc,64)
 
             bsz = len(samples)
             max_len = max(s["prompt_embeds"].shape[1] for s in samples)
@@ -680,15 +920,42 @@ def main():
                     )
 
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
-                    save_lora(transformer, output_dir / f"checkpoint-{global_step}")
+                    save_checkpoint(
+                        args,
+                        transformer=transformer,
+                        optimizer=optimizer,
+                        lr_scheduler=lr_scheduler,
+                        global_step=global_step,
+                        epoch=epoch,
+                    )
+
+                if args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                    log_validation(
+                        args,
+                        pipeline=pipeline,
+                        trackers=trackers,
+                        dataloader=dataloader,
+                        global_step=global_step,
+                        device=device,
+                    )
 
                 if global_step >= args.max_train_steps:
                     break
 
-        if global_step >= args.max_train_steps:
-            break
+    # Save final LoRA weights
+    lora_state = get_peft_model_state_dict(transformer)
+    QwenImageLoraLoaderMixin.save_lora_weights(
+        save_directory=str(output_dir),
+        transformer_lora_layers=lora_state,
+        safe_serialization=True,
+    )
 
-    save_lora(transformer, output_dir)
+    # Flush / close logging backends
+    if "tensorboard" in trackers:
+        trackers["tensorboard"].close()
+
+    if "wandb" in trackers:
+        trackers["wandb"].finish()
 
 
 if __name__ == "__main__":
