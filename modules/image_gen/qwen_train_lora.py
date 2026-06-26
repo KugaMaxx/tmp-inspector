@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument(
         "--dataset_name_or_path",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/data/Fire-Art/hf_datasets",
+        required=True,
         help="Name or path of the target dataset (HuggingFace dataset name or local path)"
     )
     parser.add_argument(
@@ -114,8 +114,20 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/outputs/qwen-gligen-lora-tmp",
+        required=True,
         help="Directory to save LoRA adapters and training logs."
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help="Directory to save training logs (TensorBoard, WandB, etc.).",
     )
 
     # Training
@@ -158,7 +170,7 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=6,
+        default=0,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -349,7 +361,7 @@ def draw_condition_image(bboxes, width, height, colors, alpha=64, draw_labels=Fa
 
 def prepare_dataset(args):
     # Load the dataset
-    dataset = load_dataset(args.dataset_name_or_path)
+    dataset = load_dataset(args.dataset_name_or_path, cache_dir=args.cache_dir)
 
     # Drop rows without boxes
     dataset = dataset.filter(lambda obj: len(obj["bbox"]) > 0, input_columns="objects")
@@ -771,7 +783,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set logging
-    logging_dir = output_dir / "logs"
+    logging_dir = Path(args.output_dir) / args.logging_dir
     logging_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -786,7 +798,7 @@ def main():
 
     # Load Qwen model and tokenizer
     transformer = QwenImageTransformer2DModel.from_pretrained(
-        args.qwen_model, subfolder="transformer", torch_dtype=dtype
+        args.qwen_model, subfolder="transformer", torch_dtype=dtype, cache_dir=args.cache_dir
     )
     transformer.to(device)
     transformer.requires_grad_(False)
