@@ -103,7 +103,6 @@ def parse_args():
     parser.add_argument(
         "--cpu_offload",
         action="store_true",
-        default=True,
         help="Enable Diffusers CPU offloading for Qwen pipeline."
     )
     parser.add_argument(
@@ -220,8 +219,6 @@ def extract_bboxes_from_text(output_text):
     return parsed_results
 
 
-# Palette of visually distinct colors. Each entry maps a color name to its RGB
-# value so the same name can be referenced in the Qwen prompt.
 COLOR_PALETTE = [
     ("red",     (255, 0, 0)),
     ("green",   (0, 200, 0)),
