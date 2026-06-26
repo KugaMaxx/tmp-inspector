@@ -774,7 +774,6 @@ def main():
     dtype = torch.bfloat16
 
     # Set random seeds for reproducibility
-    # TODO: 其它代码里也改成这样
     if args.seed is not None:
         set_seed(args.seed)
 
