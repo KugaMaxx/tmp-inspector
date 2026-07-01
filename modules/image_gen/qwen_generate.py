@@ -8,6 +8,7 @@ import torch
 import pandas as pd
 
 from diffusers import QwenImageEditPlusPipeline
+from transformers import set_seed
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -74,17 +75,25 @@ def parse_args():
         "--qwen_prompt",
         type=str,
         default=(
-            "Replace the red bounding box with {objects}. "
-            "The placeholder {objects} must only appear within the red box and match the box in dimensions. "
-            "A real-scene background shall be adopted."
+            "Replace the black background with a coherent real-world scene. "
+            "Place each object only inside its colored mask and make it fill that mask; "
+            "do not add these objects anywhere outside their mask."
         ),
-        help="Per-bbox template for image generation prompt.",
+        help="Global scene instruction prepended once before the per-bbox object prompts.",
+    )
+    parser.add_argument(
+        "--qwen_grounded_prompt",
+        type=str,
+        default=(
+            "Replace the {color} mask with {objects}."
+        ),
+        help="Per-bbox template for the object placed in each masked region.",
     )
     parser.add_argument(
         "--qwen_negative_prompt",
         type=str,
         default=(
-            " "
+            "watermark, object outside mask"
         ),
         help="Negative prompt for image generation.",
     )
@@ -220,18 +229,18 @@ def extract_bboxes_from_text(output_text):
 
 
 COLOR_PALETTE = [
-    ("red",     (255, 0, 0)),
-    ("green",   (0, 200, 0)),
-    ("blue",    (0, 0, 255)),
-    ("yellow",  (255, 255, 0)),
-    ("magenta", (255, 0, 255)),
-    ("cyan",    (0, 255, 255)),
-    ("orange",  (255, 128, 0)),
-    ("purple",  (140, 0, 255)),
-    ("pink",    (255, 105, 180)),
-    ("lime",    (170, 255, 0)),
-    ("teal",    (0, 160, 160)),
-    ("brown",   (150, 75, 0)),
+    ("red",     (255,   0,   0)),
+    ("green",   (  0, 200,   0)),
+    ("blue",    (  0,   0, 255)),
+    ("yellow",  (255, 255,   0)),
+    ("magenta", (255,   0, 255)),
+    ("cyan",    (  0, 255, 255)),
+    ("orange",  (255, 128,   0)),
+    ("purple",  (128,   0, 128)),
+    ("pink",    (255, 192, 203)),
+    ("lime",    (  0, 255,   0)),
+    ("teal",    (  0, 128, 128)),
+    ("brown",   (165,  42,  42)),
 ]
 
 
@@ -243,13 +252,12 @@ def allocate_bbox_colors(n):
     return [palette[i % len(palette)] for i in range(n)]
 
 
-def draw_condition_image(bboxes, resolution, colors, alpha=64, draw_labels=False, background=None):
+def draw_condition_image(bboxes, width, height, colors, alpha=128, draw_labels=False, background=None):
     if background is None:
-        base = Image.new("RGBA", (resolution, resolution), color=(0, 0, 0, 255))
+        base = Image.new("RGBA", (width, height), color=(0, 0, 0, 255))
     else:
         base = background.convert("RGBA")
 
-    width, height = base.size
     overlay = Image.new("RGBA", (width, height), color=(0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     font = ImageFont.load_default(size=24)
@@ -276,6 +284,10 @@ def draw_condition_image(bboxes, resolution, colors, alpha=64, draw_labels=False
 def main():
     # Parse arguments
     args = parse_args()
+
+    # Set random seeds for reproducibility
+    if args.seed is not None:
+        set_seed(args.seed)
 
     # Prepare output directory
     output_dir = Path(args.output_dir)
@@ -306,6 +318,10 @@ def main():
         args.qwen_model,
         torch_dtype=torch.bfloat16,
     )
+
+    # Load LoRA weights
+    qwen_pipeline.load_lora_weights(args.qwen_lora_weights)
+    qwen_pipeline.fuse_lora()
 
     if args.cpu_offload and args.device.startswith("cuda"):
         qwen_pipeline.enable_model_cpu_offload()
@@ -338,18 +354,21 @@ def main():
         # Assign a unique color to each bbox
         colors = allocate_bbox_colors(len(bboxes))
 
-        # Prepare Qwen prompt and condition image
-        qwen_prompt = " ".join(
-            args.qwen_prompt.format(
+        # Build condition image
+        condition_image = draw_condition_image(
+            bboxes, args.resolution, colors, alpha=255
+        )
+
+        # Build qwen prompt
+        qwen_grounded_prompt = " ".join(
+            args.qwen_grounded_prompt.format(
                 objects=label.split(",")[1].strip(),
                 color=color,
             )
             for (label, bbox), (color, rgb) in zip(bboxes, colors)
         )
+        qwen_prompt = f"{args.qwen_prompt} {qwen_grounded_prompt}"
         qwen_negative_prompt = args.qwen_negative_prompt
-        condition_image = draw_condition_image(
-            bboxes, args.resolution, colors
-        )
 
         # Generate image with Qwen
         with torch.inference_mode():
@@ -375,7 +394,7 @@ def main():
 
         ## preview file: labeled masks overlaid on the AI result
         preview_image = draw_condition_image(
-            bboxes, args.resolution, colors,
+            bboxes, args.resolution, colors, alpha=64,
             draw_labels=True, background=generated_image,
         )
         preview_image.save(preview_dir / f"{file_name}.png")

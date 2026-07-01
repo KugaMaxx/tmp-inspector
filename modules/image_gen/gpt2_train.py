@@ -11,6 +11,7 @@ import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset, Dataset
+from transformers import set_seed
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -592,6 +593,10 @@ def preprocess(examples, tokenizer, block_size):
 def main():
     # Parse arguments
     args = parse_args()
+
+    # Set random seeds for reproducibility
+    if args.seed is not None:
+        set_seed(args.seed)
 
     # Define logging directory
     logging_dir = Path(args.output_dir) / "logs" / args.tracker_name

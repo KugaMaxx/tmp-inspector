@@ -53,7 +53,9 @@ def parse_args():
         "--qwen_prompt",
         type=str,
         default=(
-            "Replace the black background with a coherent real-world scene."
+            "Replace the black background with a coherent real-world scene. "
+            "Place each object only inside its colored mask and make it fill that mask; "
+            "do not add these objects anywhere outside their mask."
         ),
         help="Global scene instruction prepended once before the per-bbox object prompts.",
     )
@@ -61,7 +63,7 @@ def parse_args():
         "--qwen_grounded_prompt",
         type=str,
         default=(
-            "Replace the {color} masked region with {objects}."
+            "Replace the {color} mask with {objects}."
         ),
         help="Per-bbox template for the object placed in each masked region.",
     )
@@ -69,7 +71,7 @@ def parse_args():
         "--qwen_negative_prompt",
         type=str,
         default=(
-            " "
+            "watermark, object outside mask"
         ),
         help="Negative prompt for image generation.",
     )
@@ -300,12 +302,12 @@ def parse_args():
 
 COLOR_PALETTE = [
     ("red",     (255,   0,   0)),
-    ("green",   (  0, 128,   0)),
+    ("green",   (  0, 200,   0)),
     ("blue",    (  0,   0, 255)),
     ("yellow",  (255, 255,   0)),
     ("magenta", (255,   0, 255)),
     ("cyan",    (  0, 255, 255)),
-    ("orange",  (255, 165,   0)),
+    ("orange",  (255, 128,   0)),
     ("purple",  (128,   0, 128)),
     ("pink",    (255, 192, 203)),
     ("lime",    (  0, 255,   0)),
@@ -330,7 +332,7 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
-def draw_condition_image(bboxes, width, height, colors, alpha=64, draw_labels=False, background=None):
+def draw_condition_image(bboxes, width, height, colors, alpha=128, draw_labels=False, background=None):
     if background is None:
         base = Image.new("RGBA", (width, height), color=(0, 0, 0, 255))
     else:
@@ -386,7 +388,7 @@ def prepare_dataset(args):
 
         # Build condition image
         vae_w, vae_h = calculate_dimensions(VAE_IMAGE_SIZE, ratio)
-        cond_image = draw_condition_image(bboxes, vae_w, vae_h, colors)
+        cond_image = draw_condition_image(bboxes, vae_w, vae_h, colors, alpha=255)
 
         # Build qwen prompt
         qwen_grounded_prompt = " ".join(
@@ -611,6 +613,7 @@ def log_validation(args, pipeline, trackers, dataloader, global_step, device):
             width=sample[0]["cond_image"].width,
             height=sample[0]["cond_image"].height,
             colors=sample[0]["colors"],
+            alpha=64,
             draw_labels=True,
             background=image
         )
@@ -821,7 +824,7 @@ def main():
 
     # Logging configuration and model details
     logger.info(f"[train] Training Arguments: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(args).items()])} \n")
-    logger.info(f"[train] Model Config: \n {transformer.config}")
+    logger.info(f"[train] Model Config: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(transformer.config).items()])} \n")
 
     # Build dataset
     dataloader = prepare_dataset(args)
