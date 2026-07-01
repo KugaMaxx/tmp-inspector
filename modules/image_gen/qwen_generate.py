@@ -356,7 +356,11 @@ def main():
 
         # Build condition image
         condition_image = draw_condition_image(
-            bboxes, args.resolution, colors, alpha=255
+            bboxes=bboxes, 
+            width=args.resolution, 
+            height=args.resolution, 
+            colors=colors, 
+            alpha=255
         )
 
         # Build qwen prompt
@@ -394,8 +398,13 @@ def main():
 
         ## preview file: labeled masks overlaid on the AI result
         preview_image = draw_condition_image(
-            bboxes, args.resolution, colors, alpha=64,
-            draw_labels=True, background=generated_image,
+            bboxes=bboxes, 
+            width=args.resolution, 
+            height=args.resolution, 
+            colors=colors, 
+            alpha=64,
+            draw_labels=True, 
+            background=generated_image,
         )
         preview_image.save(preview_dir / f"{file_name}.png")
 
