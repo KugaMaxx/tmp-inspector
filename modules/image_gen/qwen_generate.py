@@ -85,7 +85,7 @@ def parse_args():
         "--qwen_grounded_prompt",
         type=str,
         default=(
-            "Replace the {color} mask with {objects}."
+            "Replace the {color} mask with {object} ({description})."
         ),
         help="Per-bbox template for the object placed in each masked region.",
     )
@@ -141,8 +141,17 @@ def parse_args():
 def prepare_gpt_prompts(args):
     df = pd.read_csv(
         args.gpt_prompt_config,
-        usecols=["id", "category", "xs", "s", "m", "l", "xl"],
-        dtype={"id": "int64", "category": "string", "xs": "int64", "s": "int64", "m": "int64", "l": "int64", "xl": "int64"},
+        usecols=["id", "category", "xs", "s", "m", "l", "xl", "description"],
+        dtype={
+            "id": "int64",
+            "category": "string",
+            "xs": "int64",
+            "s": "int64",
+            "m": "int64",
+            "l": "int64",
+            "xl": "int64",
+            "description": "string",
+        },
         on_bad_lines="error",
     )
 
@@ -366,7 +375,7 @@ def main():
         # Build qwen prompt
         qwen_grounded_prompt = " ".join(
             args.qwen_grounded_prompt.format(
-                objects=label.split(",")[1].strip(),
+                object=label.split(",")[1].strip(),
                 color=color,
             )
             for (label, bbox), (color, rgb) in zip(bboxes, colors)

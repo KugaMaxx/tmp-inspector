@@ -280,7 +280,7 @@ def parse_args():
         default=None,
         help=(
             "Max number of checkpoints to store. "
-            "None means no checkpoints, 0 means keep all. "
+            "None means no checkpoints, 0 means keep all checkpoints."
         ),
     )
     parser.add_argument(
