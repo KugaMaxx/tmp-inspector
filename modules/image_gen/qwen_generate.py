@@ -66,6 +66,12 @@ def parse_args():
         help="Path to Qwen image editing model or model id on huggingface."
     )
     parser.add_argument(
+        "--qwen_lora_weights",
+        type=str,
+        required=True,
+        help="Path to Qwen LoRA weights."
+    )
+    parser.add_argument(
         "--resolution",
         type=int,
         default=1024,
@@ -85,7 +91,7 @@ def parse_args():
         "--qwen_grounded_prompt",
         type=str,
         default=(
-            "Replace the {color} mask with {object} ({description})."
+            "Replace the {color} mask with {object}, must follow: {description}."
         ),
         help="Per-bbox template for the object placed in each masked region.",
     )
@@ -160,6 +166,7 @@ def prepare_gpt_prompts(args):
     for row in df.itertuples(index=False):
         class_id = int(row.id)
         category = " ".join(str(row.category).strip().lower().split())
+        description = " ".join(str(row.description).strip().split())
 
         xs_n = max(0, int(row.xs))
         s_n = max(0, int(row.s))
@@ -167,11 +174,11 @@ def prepare_gpt_prompts(args):
         l_n = max(0, int(row.l))
         xl_n = max(0, int(row.xl))
 
-        object_pool.extend([(f"[xs, {category}]", class_id)] * xs_n)
-        object_pool.extend([(f"[s, {category}]",  class_id)] * s_n)
-        object_pool.extend([(f"[m, {category}]",  class_id)] * m_n)
-        object_pool.extend([(f"[l, {category}]",  class_id)] * l_n)
-        object_pool.extend([(f"[xl, {category}]", class_id)] * xl_n)
+        object_pool.extend([(f"[xs, {category}]", class_id, description)] * xs_n)
+        object_pool.extend([(f"[s, {category}]",  class_id, description)] * s_n)
+        object_pool.extend([(f"[m, {category}]",  class_id, description)] * m_n)
+        object_pool.extend([(f"[l, {category}]",  class_id, description)] * l_n)
+        object_pool.extend([(f"[xl, {category}]", class_id, description)] * xl_n)
 
     # Randomly consume object pool to create multiple random combinations
     items = []
@@ -189,9 +196,10 @@ def prepare_gpt_prompts(args):
             selected.append(object_pool.pop(i))
         random.shuffle(selected)
 
-        prompt = ", ".join([p for p, _ in selected]) + " ;"
-        class_ids = [cid for _, cid in selected]
-        items.append((prompt, class_ids))
+        prompt = ", ".join([p for p, _, _ in selected]) + " ;"
+        class_ids = [cid for _, cid, _ in selected]
+        descriptions = [desc for _, _, desc in selected]
+        items.append((prompt, class_ids, descriptions))
 
     return items
 
@@ -337,7 +345,7 @@ def main():
     else:
         qwen_pipeline = qwen_pipeline.to(args.device)
 
-    for idx, (gpt_prompt, class_ids) in enumerate(gpt_items):
+    for idx, (gpt_prompt, class_ids, descriptions) in enumerate(gpt_items):
         print(idx)
 
         # Generate bounding boxes with GPT-2
@@ -375,10 +383,11 @@ def main():
         # Build qwen prompt
         qwen_grounded_prompt = " ".join(
             args.qwen_grounded_prompt.format(
-                object=label.split(",")[1].strip(),
                 color=color,
+                object=label.split(",")[1].strip(),
+                description=description,
             )
-            for (label, bbox), (color, rgb) in zip(bboxes, colors)
+            for (label, bbox), (color, rgb), description in zip(bboxes, colors, descriptions)
         )
         qwen_prompt = f"{args.qwen_prompt} {qwen_grounded_prompt}"
         qwen_negative_prompt = args.qwen_negative_prompt
