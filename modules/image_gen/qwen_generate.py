@@ -364,6 +364,7 @@ def main():
         args.qwen_model,
         torch_dtype=torch.bfloat16,
     )
+    qwen_pipeline.set_progress_bar_config(disable=True) 
 
     # Load LoRA weights
     logger.info("Loading Qwen image edit LoRA weights...")
@@ -375,9 +376,14 @@ def main():
     else:
         qwen_pipeline = qwen_pipeline.to(args.device)
 
-    for idx, (gpt_prompt, class_ids, descriptions) in enumerate(gpt_items):
-        print(idx)
+    # Initialize progress bar
+    progress_bar = tqdm(
+        range(0, len(gpt_items)),
+        desc="Images",
+    )
 
+    logger.info(f"Starting image generation pipeline...")
+    for idx, (gpt_prompt, class_ids, descriptions) in enumerate(gpt_items):
         # Generate bounding boxes with GPT-2
         input_ids = gpt_tokenizer(gpt_prompt, return_tensors="pt").to(args.device)
         with torch.no_grad():
@@ -395,7 +401,10 @@ def main():
         # Extract bounding boxes from GPT output
         bboxes = extract_bboxes_from_text(output_text)
         if bboxes is None:
-            print("Failed to extract valid bounding boxes from GPT output. Skipping this item.")
+            progress_bar.write(
+                f"[{idx}] Failed to extract valid bounding boxes from GPT output. Skipping this item."
+            )
+            progress_bar.update(1)
             continue
 
         # Assign a unique color to each bbox
@@ -434,7 +443,7 @@ def main():
             ).images[0]
 
         # Save YOLO file
-        file_name = f"{time.time():010d}"
+        file_name = f"{int(datetime.now().timestamp()):010d}"
 
         ## label file
         with open(label_dir / f"{file_name}.txt", "w") as f:
