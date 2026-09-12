@@ -1,7 +1,10 @@
 import re
 import random
+import logging
 import argparse
+from tqdm import tqdm
 from pathlib import Path
+from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
 import torch
@@ -10,6 +13,9 @@ import pandas as pd
 from diffusers import QwenImageEditPlusPipeline
 from transformers import set_seed
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -139,6 +145,12 @@ def parse_args():
         type=str, 
         default='Qwen-Fire',
         help="Directory to save generated YOLO label txt files."
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help="Directory to save training logs (TensorBoard, WandB, etc.).",
     )
 
     return parser.parse_args()
@@ -310,33 +322,51 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    label_dir = output_dir / "labels"
+    label_dir = output_dir / "labels" / "train"
     label_dir.mkdir(parents=True, exist_ok=True)
 
-    image_dir = output_dir / "images"
+    image_dir = output_dir / "images" / "train"
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    preview_dir = output_dir / "previews"
+    preview_dir = output_dir / "previews" / "train"
     preview_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set logging
+    logging_dir = Path(args.output_dir) / args.logging_dir
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[
+            logging.FileHandler(logging_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
+        ],
+    )
+    logger.info(f"Starting script: {Path(__file__).name}")
+
+    # Logging configuration and model details
+    logger.info(f"Script Arguments: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(args).items()])} \n")
+
     # Load GPT-2 model and tokenizer
-    print("Loading GPT-2 model and tokenizer...")
+    logger.info("Loading GPT-2 model and tokenizer...")
     gpt_tokenizer = AutoTokenizer.from_pretrained(args.gpt_model)
     gpt_model = AutoModelForCausalLM.from_pretrained(args.gpt_model).to(args.device)
     gpt_model.eval()
 
     # Prepare GPT prompts
-    print("Preparing GPT prompts...")
+    logger.info("Preparing GPT prompts...")
     gpt_items = prepare_gpt_prompts(args)
 
     # Load Qwen image edit model
-    print("Loading Qwen image edit model...")
+    logger.info("Loading Qwen image edit model...")
     qwen_pipeline = QwenImageEditPlusPipeline.from_pretrained(
         args.qwen_model,
         torch_dtype=torch.bfloat16,
     )
 
     # Load LoRA weights
+    logger.info("Loading Qwen image edit LoRA weights...")
     qwen_pipeline.load_lora_weights(args.qwen_lora_weights)
     qwen_pipeline.fuse_lora()
 
@@ -404,7 +434,7 @@ def main():
             ).images[0]
 
         # Save YOLO file
-        file_name = f"{idx:010d}"
+        file_name = f"{time.time():010d}"
 
         ## label file
         with open(label_dir / f"{file_name}.txt", "w") as f:
@@ -425,6 +455,9 @@ def main():
             background=generated_image,
         )
         preview_image.save(preview_dir / f"{file_name}.png")
+
+        logger.info(f"  Generated image saved [{idx} / {len(gpt_items)}]: ID-{f'{file_name}'}")
+        progress_bar.update(1)
 
 
 if __name__ == "__main__":
