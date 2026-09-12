@@ -402,7 +402,7 @@ def main():
         bboxes = extract_bboxes_from_text(output_text)
         if bboxes is None:
             progress_bar.write(
-                f"[{idx}] Failed to extract valid bounding boxes from GPT output. Skipping this item."
+                f"  Failed to extract valid bounding boxes. Skipping [{idx} / {len(gpt_items)}]: ID-{f'{file_name}'}"
             )
             progress_bar.update(1)
             continue
