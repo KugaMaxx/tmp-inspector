@@ -217,6 +217,7 @@ class ValidationCallback(TrainerCallback):
         
         logger.info(
             f"step: {state.global_step} | "
+            f"epoch: {state.epoch:.2f} | "
             f"loss: {logs.get('loss', 'N/A'):.4f} | "
             f"grad_norm: {logs.get('grad_norm', 'N/A'):.4f} | "
             f"learning_rate: {logs.get('learning_rate', 'N/A'):.4e}"
