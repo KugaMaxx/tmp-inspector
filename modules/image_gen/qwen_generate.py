@@ -1,18 +1,25 @@
 import re
 import random
+import logging
 import argparse
+from tqdm import tqdm
 from pathlib import Path
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
 
 import torch
 import pandas as pd
-from PIL import Image, ImageDraw
 
 from diffusers import QwenImageEditPlusPipeline
+from transformers import set_seed
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+logger = logging.getLogger(__name__)
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run trained GPT-2 on prompts and save YOLO labels.")
+    parser = argparse.ArgumentParser(description="AI Image Generator.")
     # GPT-2 generation settings
     parser.add_argument(
         "--gpt_model", 
@@ -21,7 +28,7 @@ def parse_args():
         help="Path to trained GPT-2 model."
     )
     parser.add_argument(
-        "--prompt_csv", 
+        "--gpt_prompt_config", 
         type=str, 
         required=True,
         help="CSV file with columns: id,category,small,medium,large."
@@ -32,70 +39,6 @@ def parse_args():
         default=1,
         help="Maximum number of objects in one generated prompt. <=0 means no limit."
     )
-
-    # Qwen image generation settings
-    parser.add_argument(
-        "--qwen_model",
-        type=str,
-        default="Qwen/Qwen-Image-Edit-2511",
-        help="Path to Qwen image editing model or model id on huggingface."
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=1024,
-        help="Square image resolution for condition and generated images."
-    )
-    parser.add_argument(
-        "--qwen_prompt",
-        type=str,
-        default=(
-            "replace ONLY the red bounding boxes with: {objects}. "
-            "make them appear as if they were always part of the scene. "
-            "keep object count and positions aligned with the red boxes. "
-            "consistent lighting with surroundings, photorealistic indoor environment. "
-            "do not change image size."
-        ),
-        help="Prompt template for Qwen image generation. Use {objects} as placeholder."
-    )
-    parser.add_argument(
-        "--negative_prompt",
-        type=str,
-        default="text, watermark, logo, red outline, red rectangle, distorted",
-        help="Negative prompt for Qwen image generation."
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=1.0,
-        help="Guidance scale for Qwen image generation."
-    )
-    parser.add_argument(
-        "--true_cfg_scale",
-        type=float,
-        default=4.0,
-        help="True CFG scale for Qwen image generation."
-    )
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=10,
-        help="Number of inference steps for Qwen image generation."
-    )
-    parser.add_argument(
-        "--cpu_offload",
-        action="store_true",
-        default=True,
-        help="Enable Diffusers CPU offloading for Qwen pipeline."
-    )
-
-    # Inference settings
-    parser.add_argument(
-        "--device", 
-        type=str, 
-        default='cuda' if torch.cuda.is_available() else 'cpu', 
-        help='Inference device, e.g. "cuda" or "cpu".'
-    )
     parser.add_argument(
         "--max_new_tokens", 
         type=int, 
@@ -105,6 +48,7 @@ def parse_args():
     parser.add_argument(
         "--do_sample", 
         action="store_true", 
+        default=True,
         help="Enable sampling during generation."
     )
     parser.add_argument(
@@ -120,42 +64,142 @@ def parse_args():
         help="Top-p sampling."
     )
 
-    # Output settings
+    # Qwen immage generation settings
+    parser.add_argument(
+        "--qwen_model",
+        type=str,
+        default="Qwen/Qwen-Image-Edit-2511",
+        help="Path to Qwen image editing model or model id on huggingface."
+    )
+    parser.add_argument(
+        "--qwen_lora_weights",
+        type=str,
+        required=True,
+        help="Path to Qwen LoRA weights."
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=1024,
+        help="Square image resolution for condition and generated images."
+    )
+    parser.add_argument(
+        "--qwen_prompt",
+        type=str,
+        default=(
+            "Replace the black background with a coherent real-world scene. "
+            "Place each object only inside its colored mask and make it fill that mask; "
+            "do not add these objects anywhere outside their mask."
+        ),
+        help="Global scene instruction prepended once before the per-bbox object prompts.",
+    )
+    parser.add_argument(
+        "--qwen_grounded_prompt",
+        type=str,
+        default=(
+            "Replace the {color} mask with {object}, must follow: {description}."
+        ),
+        help="Per-bbox template for the object placed in each masked region.",
+    )
+    parser.add_argument(
+        "--qwen_negative_prompt",
+        type=str,
+        default=(
+            "watermark, object outside mask"
+        ),
+        help="Negative prompt for image generation.",
+    )
+    parser.add_argument(
+        "--cfg_scale",
+        type=float,
+        default=4.0,
+        help="Classifier-free guidance scale for Qwen image generation."
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=40,
+        help="Number of inference steps for Qwen image generation."
+    )
+    parser.add_argument(
+        "--cpu_offload",
+        action="store_true",
+        help="Enable Diffusers CPU offloading for Qwen pipeline."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for API generation. If None, uses random seed per image.",
+    )
+
+    # Common settings
+    parser.add_argument(
+        "--device", 
+        type=str, 
+        default='cuda' if torch.cuda.is_available() else 'cpu', 
+        help='Inference device, e.g. "cuda" or "cpu".'
+    )
     parser.add_argument(
         "--output_dir", 
         type=str, 
         default='Qwen-Fire',
         help="Directory to save generated YOLO label txt files."
     )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="logs",
+        help="Directory to save training logs (TensorBoard, WandB, etc.).",
+    )
 
     return parser.parse_args()
 
 
-def build_prompts(prompt_csv, max_objects_per_prompt):
-    object_pool = []
+def prepare_gpt_prompts(args):
     df = pd.read_csv(
-        prompt_csv,
-        usecols=["id", "category", "small", "medium", "large"],
-        dtype={"id": "int64", "category": "string", "small": "int64", "medium": "int64", "large": "int64"},
+        args.gpt_prompt_config,
+        usecols=["id", "category", "xs", "s", "m", "l", "xl", "description"],
+        dtype={
+            "id": "int64",
+            "category": "string",
+            "xs": "int64",
+            "s": "int64",
+            "m": "int64",
+            "l": "int64",
+            "xl": "int64",
+            "description": "string",
+        },
         on_bad_lines="error",
     )
 
     # Build an object pool
+    object_pool = []
     for row in df.itertuples(index=False):
         class_id = int(row.id)
         category = " ".join(str(row.category).strip().lower().split())
-        small_n = max(0, int(row.small))
-        medium_n = max(0, int(row.medium))
-        large_n = max(0, int(row.large))
+        description = " ".join(str(row.description).strip().split())
 
-        object_pool.extend([(f"[small, {category}]", class_id)] * small_n)
-        object_pool.extend([(f"[medium, {category}]", class_id)] * medium_n)
-        object_pool.extend([(f"[large, {category}]", class_id)] * large_n)
+        xs_n = max(0, int(row.xs))
+        s_n = max(0, int(row.s))
+        m_n = max(0, int(row.m))
+        l_n = max(0, int(row.l))
+        xl_n = max(0, int(row.xl))
+
+        object_pool.extend([(f"[xs, {category}]", class_id, description)] * xs_n)
+        object_pool.extend([(f"[s, {category}]",  class_id, description)] * s_n)
+        object_pool.extend([(f"[m, {category}]",  class_id, description)] * m_n)
+        object_pool.extend([(f"[l, {category}]",  class_id, description)] * l_n)
+        object_pool.extend([(f"[xl, {category}]", class_id, description)] * xl_n)
 
     # Randomly consume object pool to create multiple random combinations
     items = []
     while len(object_pool) > 0:
-        max_n = len(object_pool) if max_objects_per_prompt <= 0 else min(max_objects_per_prompt, len(object_pool))
+        max_n = (
+            len(object_pool)
+            if args.max_objects_per_prompt <= 0
+            else min(args.max_objects_per_prompt, len(object_pool))
+        )
         n = random.randint(1, max_n)
 
         selected_indices = random.sample(range(len(object_pool)), n)
@@ -164,154 +208,265 @@ def build_prompts(prompt_csv, max_objects_per_prompt):
             selected.append(object_pool.pop(i))
         random.shuffle(selected)
 
-        prompt = ", ".join([p for p, _ in selected]) + " ;"
-        class_ids = [cid for _, cid in selected]
-        items.append((prompt, class_ids))
+        prompt = ", ".join([p for p, _, _ in selected]) + " ;"
+        class_ids = [cid for _, cid, _ in selected]
+        descriptions = [desc for _, _, desc in selected]
+        items.append((prompt, class_ids, descriptions))
 
     return items
 
 
-def extract_generated_bboxes(decoded_text):
-    if ";" not in decoded_text:
-        return []
-    
-    BBOX_PATTERN = re.compile(
-        r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]"
-    )
+def extract_bboxes_from_text(output_text):
+    if ";" not in output_text:
+        return None
 
-    response_part = decoded_text.split(";", 1)[1]
-    boxes = []
-    for x_str, y_str, w_str, h_str in BBOX_PATTERN.findall(response_part):
-        x, y, w, h = float(x_str), float(y_str), float(w_str), float(h_str)
-        # keep only valid YOLO normalized values
-        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0:
-            boxes.append((x, y, w, h))
-    return boxes
+    # extract prompt and response parts
+    prompt, response = output_text.split(";", 1)
+    response = response.split(";", 1)[0]
+
+    # extract info
+    labels = re.findall(r"\[(.*?)\]", prompt)
+    bboxes = re.findall(r"\[(.*?)\]", response)
+
+    if len(labels) == 0 or len(bboxes) == 0 or len(labels) > len(bboxes):
+        return None
+
+    # only consider up to the number of labels
+    n = len(labels)
+
+    # parse bbox coordinates
+    parsed_results = []
+    for label, bbox in zip(labels[:n], bboxes[:n]):
+        vals = [v.strip() for v in bbox.split(",")]
+
+        # Expecting exactly 4 values: x, y, w, h
+        if len(vals) != 4:
+            return None
+        try:
+            x, y, w, h = [float(v) for v in vals]
+        except ValueError:
+            return None
+
+        # Strict [x, y, w, h] normalized format
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0):
+            return None
+
+        # append valid bbox
+        parsed_results.append([label, [x, y, w, h]])
+
+    return parsed_results
 
 
-def write_yolo_label(label_path, class_ids, bboxes):
-    n = min(len(class_ids), len(bboxes))
-    with open(label_path, "w", encoding="utf-8") as f:
-        for class_id, (x, y, w, h) in zip(class_ids[:n], bboxes[:n]):
-            f.write(f"{class_id} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n")
+COLOR_PALETTE = [
+    ("red",     (255,   0,   0)),
+    ("green",   (  0, 200,   0)),
+    ("blue",    (  0,   0, 255)),
+    ("yellow",  (255, 255,   0)),
+    ("magenta", (255,   0, 255)),
+    ("cyan",    (  0, 255, 255)),
+    ("orange",  (255, 128,   0)),
+    ("purple",  (128,   0, 128)),
+    ("pink",    (255, 192, 203)),
+    ("lime",    (  0, 255,   0)),
+    ("teal",    (  0, 128, 128)),
+    ("brown",   (165,  42,  42)),
+]
 
 
-def prompt_to_object_texts(prompt):
-    parts = re.findall(r"\[\s*(small|medium|large)\s*,\s*([^\]]+?)\s*\]", prompt, flags=re.IGNORECASE)
-    return [f"{size.lower()} {category.strip()}" for size, category in parts]
+def allocate_bbox_colors(n):
+    palette = COLOR_PALETTE.copy()
+    random.shuffle(palette)
+    if n <= len(palette):
+        return palette[:n]
+    return [palette[i % len(palette)] for i in range(n)]
 
 
-def yolo_to_xyxy(box, resolution):
-    x, y, w, h = box
-    x1 = (x - w / 2.0) * resolution
-    y1 = (y - h / 2.0) * resolution
-    x2 = (x + w / 2.0) * resolution
-    y2 = (y + h / 2.0) * resolution
-    return x1, y1, x2, y2
+def draw_condition_image(bboxes, width, height, colors, alpha=128, draw_labels=False, background=None):
+    if background is None:
+        base = Image.new("RGBA", (width, height), color=(0, 0, 0, 255))
+    else:
+        base = background.convert("RGBA")
 
+    overlay = Image.new("RGBA", (width, height), color=(0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default(size=24)
 
-def draw_condition_image(bboxes, resolution, outline_width=6):
-    img = Image.new("RGB", (resolution, resolution), color=(0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    for (label, bbox), (_, rgb) in zip(bboxes, colors):
+        x, y, w, h = bbox
+        left   = int((x - w / 2.0) * width)
+        top    = int((y - h / 2.0) * height)
+        right  = int((x + w / 2.0) * width)
+        bottom = int((y + h / 2.0) * height)
 
-    for box in bboxes:
-        x1, y1, x2, y2 = yolo_to_xyxy(box, resolution)
-        x1 = max(0.0, min(float(resolution - 1), x1))
-        y1 = max(0.0, min(float(resolution - 1), y1))
-        x2 = max(0.0, min(float(resolution - 1), x2))
-        y2 = max(0.0, min(float(resolution - 1), y2))
+        # semi-transparent mask fill
+        draw.rectangle([left, top, right, bottom], fill=(*rgb, alpha))
 
-        if x2 > x1 and y2 > y1:
-            draw.rectangle([x1, y1, x2, y2], outline="red", width=outline_width)
+        if draw_labels and label is not None:
+            (text_width, text_height), (_, _) = font.font.getsize(label)
+            text_x = left if left + text_width < width else width - text_width
+            text_y = top if top + text_height < height else height - text_height
+            draw.text((text_x, text_y), label, fill=(255, 255, 255, 255), font=font)
 
-    return img
+    return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def main():
     # Parse arguments
     args = parse_args()
 
-    # Create output directory
-    output_root = Path(args.output_dir)
-    labels_dir = output_root / "labels"
-    condition_images_dir = output_root / "condition_images"
-    generated_images_dir = output_root / "images"
+    # Set random seeds for reproducibility
+    if args.seed is not None:
+        set_seed(args.seed)
 
-    labels_dir.mkdir(parents=True, exist_ok=True)
-    condition_images_dir.mkdir(parents=True, exist_ok=True)
-    generated_images_dir.mkdir(parents=True, exist_ok=True)
+    # Prepare output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.gpt_model)
+    label_dir = output_dir / "labels" / "train"
+    label_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load GPT-2 model
-    gpt_ml = AutoModelForCausalLM.from_pretrained(args.gpt_model).to(args.device)
-    gpt_ml.eval()
+    image_dir = output_dir / "images" / "train"
+    image_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load Qwen image pipeline
-    qwen_dtype = torch.bfloat16 if args.device.startswith("cuda") and torch.cuda.is_available() else torch.float32
+    preview_dir = output_dir / "previews" / "train"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set logging
+    logging_dir = Path(args.output_dir) / args.logging_dir
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[
+            logging.FileHandler(logging_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
+        ],
+    )
+    logger.info(f"Starting script: {Path(__file__).name}")
+
+    # Logging configuration and model details
+    logger.info(f"Script Arguments: \n {'\n '.join([f'{arg}: {value}' for arg, value in vars(args).items()])} \n")
+
+    # Load GPT-2 model and tokenizer
+    logger.info("Loading GPT-2 model and tokenizer...")
+    gpt_tokenizer = AutoTokenizer.from_pretrained(args.gpt_model)
+    gpt_model = AutoModelForCausalLM.from_pretrained(args.gpt_model).to(args.device)
+    gpt_model.eval()
+
+    # Prepare GPT prompts
+    logger.info("Preparing GPT prompts...")
+    gpt_items = prepare_gpt_prompts(args)
+
+    # Load Qwen image edit model
+    logger.info("Loading Qwen image edit model...")
     qwen_pipeline = QwenImageEditPlusPipeline.from_pretrained(
         args.qwen_model,
-        torch_dtype=qwen_dtype,
+        torch_dtype=torch.bfloat16,
     )
+    qwen_pipeline.set_progress_bar_config(disable=True) 
+
+    # Load LoRA weights
+    logger.info("Loading Qwen image edit LoRA weights...")
+    qwen_pipeline.load_lora_weights(args.qwen_lora_weights)
+    qwen_pipeline.fuse_lora()
 
     if args.cpu_offload and args.device.startswith("cuda"):
         qwen_pipeline.enable_model_cpu_offload()
     else:
         qwen_pipeline = qwen_pipeline.to(args.device)
 
-    # Build prompts randomly
-    prompt_items = build_prompts(args.prompt_csv, args.max_objects_per_prompt)
+    # Initialize progress bar
+    progress_bar = tqdm(
+        range(0, len(gpt_items)),
+        desc="Images",
+    )
 
-    # Process prompts and generate labels
-    for idx, (prompt, prompt_class_ids) in enumerate(prompt_items):
-
+    logger.info(f"Starting image generation pipeline...")
+    for idx, (gpt_prompt, class_ids, descriptions) in enumerate(gpt_items):
         # Generate bounding boxes with GPT-2
-        inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
+        input_ids = gpt_tokenizer(gpt_prompt, return_tensors="pt").to(args.device)
         with torch.no_grad():
-            outputs = gpt_ml.generate(
-                **inputs,
+            output_ids = gpt_model.generate(
+                **input_ids,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=gpt_tokenizer.eos_token_id,
+                eos_token_id=gpt_tokenizer.eos_token_id,
+            )[0]
+        output_text = gpt_tokenizer.decode(output_ids, skip_special_tokens=True)
+
+        # Extract bounding boxes from GPT output
+        bboxes = extract_bboxes_from_text(output_text)
+        if bboxes is None:
+            progress_bar.write(
+                f"  Failed to extract valid bounding boxes. Skipping [{idx} / {len(gpt_items)}]: ID-{f'{file_name}'}"
             )
-        decoded_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            progress_bar.update(1)
+            continue
 
-        # 
-        bboxes = extract_generated_bboxes(decoded_text)
-        n = min(len(prompt_class_ids), len(bboxes))
-        aligned_class_ids = prompt_class_ids[:n]
-        aligned_bboxes = bboxes[:n]
+        # Assign a unique color to each bbox
+        colors = allocate_bbox_colors(len(bboxes))
 
-        label_path = labels_dir / f"{idx:06d}.txt"
-        write_yolo_label(label_path, aligned_class_ids, aligned_bboxes)
+        # Build condition image
+        condition_image = draw_condition_image(
+            bboxes=bboxes, 
+            width=args.resolution, 
+            height=args.resolution, 
+            colors=colors, 
+            alpha=255
+        )
 
-        # Build condition image from generated bboxes
-        condition_img = draw_condition_image(aligned_bboxes, args.resolution)
-        condition_path = condition_images_dir / f"{idx:06d}.jpg"
-        condition_img.save(condition_path, "JPEG", quality=95)
+        # Build qwen prompt
+        qwen_grounded_prompt = " ".join(
+            args.qwen_grounded_prompt.format(
+                color=color,
+                object=label.split(",")[1].strip(),
+                description=description,
+            )
+            for (label, bbox), (color, rgb), description in zip(bboxes, colors, descriptions)
+        )
+        qwen_prompt = f"{args.qwen_prompt} {qwen_grounded_prompt}"
+        qwen_negative_prompt = args.qwen_negative_prompt
 
-        # Build Qwen prompt and generate final image
-        object_texts = prompt_to_object_texts(prompt)
-        object_texts = object_texts[:n]
-        objects_desc = ", ".join(object_texts) if object_texts else "target objects"
-        qwen_prompt = args.qwen_prompt.format(objects=objects_desc)
+        # Generate image with Qwen
+        with torch.inference_mode():
+            generated_image = qwen_pipeline(
+                image=[condition_image],
+                prompt=qwen_prompt,
+                negative_prompt=qwen_negative_prompt,
+                generator=torch.manual_seed(args.seed if args.seed is not None else random.randint(0, int(1e6))),
+                num_inference_steps=args.num_inference_steps,
+                true_cfg_scale=args.cfg_scale,
+            ).images[0]
 
-        generated_img = qwen_pipeline(
-            image=[condition_img],
-            prompt=qwen_prompt,
-            negative_prompt=args.negative_prompt,
-            guidance_scale=args.guidance_scale,
-            true_cfg_scale=args.true_cfg_scale,
-            num_inference_steps=args.num_inference_steps,
-            num_images_per_prompt=1,
-        ).images[0]
+        # Save YOLO file
+        file_name = f"{int(datetime.now().timestamp()):010d}"
 
-        generated_path = generated_images_dir / f"{idx:06d}.jpg"
-        generated_img.save(generated_path, "JPEG", quality=95)
+        ## label file
+        with open(label_dir / f"{file_name}.txt", "w") as f:
+            for class_id, (_, bbox) in zip(class_ids, bboxes):
+                f.write(f"{class_id} {bbox[0]:.6f} {bbox[1]:.6f} {bbox[2]:.6f} {bbox[3]:.6f}\n")
+        
+        ## image file
+        generated_image.save(image_dir / f"{file_name}.png")
+
+        ## preview file: labeled masks overlaid on the AI result
+        preview_image = draw_condition_image(
+            bboxes=bboxes, 
+            width=args.resolution, 
+            height=args.resolution, 
+            colors=colors, 
+            alpha=64,
+            draw_labels=True, 
+            background=generated_image,
+        )
+        preview_image.save(preview_dir / f"{file_name}.png")
+
+        logger.info(f"  Generated image saved [{idx} / {len(gpt_items)}]: ID-{f'{file_name}'}")
+        progress_bar.update(1)
 
 
 if __name__ == "__main__":

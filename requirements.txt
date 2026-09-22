@@ -1,4 +1,6 @@
+accelerate
 datasets
 diffusers
+peft
 transformers
 ultralytics
