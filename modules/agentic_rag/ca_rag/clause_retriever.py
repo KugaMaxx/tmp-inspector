@@ -1,5 +1,5 @@
 """Clause-aware retrieval: hybrid BM25 + dense search fused with RRF, then
-expanded along the cross-references declared in each clause."""
+    expanded along the local and global cross-references declared in each clause."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class ClauseAwareRetriever(BaseRetriever):
         nodes: the same clause nodes, used for the BM25 index and for
             resolving references by their ``ID``.
         similarity_top_k: number of clauses kept after fusion (``K``).
-        expand: whether to follow the ``Ref`` of every retrieved clause.
+        expand: whether to follow ``local_ref`` and ``global_ref`` of every retrieved clause.
     """
 
     def __init__(
@@ -71,7 +71,11 @@ class ClauseAwareRetriever(BaseRetriever):
         seen = {node.node.metadata.get("ID") for node in retrieved}
         expanded: List[NodeWithScore] = []
         for node in retrieved:
-            for ref_id in node.node.metadata.get("Ref", []):
+            refs = [
+                *node.node.metadata.get("local_ref", []),
+                *node.node.metadata.get("global_ref", []),
+            ]
+            for ref_id in refs:
                 cited = self._nodes_by_id.get(ref_id)
                 if cited is None or ref_id in seen:
                     continue

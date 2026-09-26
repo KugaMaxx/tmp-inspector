@@ -66,7 +66,7 @@ class MineruDirectoryReader(BaseReader):
 
     def _load_corpus_config(self) -> Dict[str, Dict[str, str]]:
         """
-        Read the per-document settings, keyed by file name.
+        Read the per-document settings, keyed by document name.
 
         Front matter is declared rather than detected: a cover, a foreword and a
         table of contents repeat the headings of the body and would be chunked as
@@ -79,17 +79,17 @@ class MineruDirectoryReader(BaseReader):
 
         with open(self.corpus_csv, newline="", encoding="utf-8") as f:
             config = {
-                row["file_name"].strip(): {
-                    "doc_code": (row.get("doc_code") or "").strip(),
-                    "skip_pages": (row.get("skip_pages") or "").strip(),
+                row["name"].strip(): {
+                    "code": (row.get("code") or "").strip(),
+                    "skip": (row.get("skip") or "").strip(),
                 }
                 for row in csv.DictReader(f)
-                if (row.get("file_name") or "").strip()
+                if (row.get("name") or "").strip()
             }
         logger.info(f"Loaded settings for {len(config)} documents from {self.corpus_csv}")
         return config
 
-    def _page_range_of(self, path: Path, skip_pages: str) -> str:
+    def _page_range_of(self, path: Path, skip: str) -> str:
         """
         Translate the pages to skip into the page range MinerU keeps.
 
@@ -104,12 +104,12 @@ class MineruDirectoryReader(BaseReader):
         n_pages = len(PdfReader(str(path)).pages)
 
         # Translate the pages to skip into the page range MinerU keeps.
-        skip = parse_page_range_set(skip_pages) if skip_pages else set()
+        skipped = parse_page_range_set(skip) if skip else set()
 
         # Check that the resulting page range is not empty.
-        keep = [p for p in range(1, n_pages + 1) if p not in skip]
+        keep = [p for p in range(1, n_pages + 1) if p not in skipped]
         if not keep:
-            raise ValueError(f"{path.name}: skip_pages {skip_pages!r} would skip all {n_pages} pages")
+            raise ValueError(f"{path.name}: skip {skip!r} would skip all {n_pages} pages")
 
         return format_page_range(keep)
 
@@ -150,12 +150,12 @@ class MineruDirectoryReader(BaseReader):
         """
         config = self._load_corpus_config()
         for path in self._input_files():
-            settings = config.get(path.name, {})
-            if path.name not in config:
+            settings = config.get(path.stem, {})
+            if path.stem not in config:
                 logger.warning(f"{path.name}: absent from the corpus config, parsing in full")
 
             # Translate the pages to skip into the page range MinerU keeps.
-            page_range = self._page_range_of(path, settings.get("skip_pages", ""))
+            page_range = self._page_range_of(path, settings.get("skip", ""))
 
             # Parse the document with MinerU, caching the result if requested.
             pages = self._parse_layout(path, page_range)
@@ -168,7 +168,7 @@ class MineruDirectoryReader(BaseReader):
                 metadata={
                     "file_name": path.name,
                     "file_path": str(path),
-                    "doc_code": settings.get("doc_code", ""),
+                    "code": settings.get("code", ""),
                     "mineru_pages": pages,
                 },
                 # bookkeeping for the parser, never embedded or shown to an LLM

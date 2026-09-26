@@ -1,15 +1,3 @@
-"""Build the clause-aware RAG index of a regulatory corpus.
-
-    python -m modules.agentic_rag.carag_build \
-        --corpus_dir data/RAG/test \
-        --question "What is the minimum width of an exit door?"
-
-Documents are laid out by MinerU, chunked into one node per normative clause,
-embedded and persisted. Passing ``--cache_dir`` caches the layout analysis per
-document, so only the first run pays for it. Passing ``--question`` retrieves
-clauses and prints them as they are stored, without asking an LLM.
-"""
-
 from __future__ import annotations
 
 import os
@@ -49,14 +37,14 @@ def parse_args():
     parser.add_argument(
         "--corpus_dir",
         type=str,
-        default="/home/dszh/workspace/tmp-inspector/data/RAG/test",
+        default="/home/dszh/workspace/tmp-inspector/data/RAG/CoP",
         help="Directory containing the corpus files."
     )
     parser.add_argument(
         "--corpus_csv",
         type=str,
         default="/home/dszh/workspace/tmp-inspector/configs/corpus.csv",
-        help="CSV with columns: file_name,doc_code,skip_pages. Files absent from it are parsed in full."
+        help="CSV with columns: code,name,skip. Files absent from it are parsed in full."
     )
     parser.add_argument(
         "--index_dir",
@@ -86,18 +74,12 @@ def parse_args():
         help="MinerU parse tier; higher tiers read harder layouts at a lower speed."
     )
 
-    # Chunking settings
+    # Clause analysis settings
     parser.add_argument(
-        "--min_clause_chars",
-        type=int,
-        default=40,
-        help="Clauses shorter than this are merged into the preceding one."
-    )
-    parser.add_argument(
-        "--max_clause_chars",
-        type=int,
-        default=4000,
-        help="Clauses longer than this are cut into successive parts."
+        "--parse_model",
+        type=str,
+        default=None,
+        help="Optional Hugging Face text-generation model for topic and reference extraction."
     )
 
     # Embedding settings
@@ -124,7 +106,7 @@ def parse_args():
     parser.add_argument(
         "--question",
         type=str,
-        default="For sprinkler protected building, which should be provided?",
+        default="When may a building be permitted to have only one required staircase?", # Clause B6.1
         help="Retrieve clauses for this question and print them. No LLM is called."
     )
     parser.add_argument(
@@ -152,10 +134,11 @@ def print_retrieved(question: str, results) -> None:
     for hit in results:
         kind = "matched" if hit.score else "cited by a match"
         score = f"{hit.score:.4f}" if hit.score else "-"
-        print(f"[{kind}] {hit.node.metadata['ID']}  score={score}")
-        print(f"  Topic: {hit.node.metadata['Topic']}")
-        print(f"  Hier : {hit.node.metadata['Hier']}")
-        print(f"  Ref  : {hit.node.metadata['Ref']}")
+        print(f"[{kind}]  score={score}")
+        print(f"  topic: {hit.node.metadata['topic']}")
+        print(f"  hier : {hit.node.metadata['hier']}")
+        print(f"  local_ref : {hit.node.metadata.get('local_ref', [])}")
+        print(f"  global_ref: {hit.node.metadata.get('global_ref', [])}")
         print(f"  {hit.node.get_content(metadata_mode='none')[:300]}...\n")
 
 
@@ -196,14 +179,13 @@ def main():
     # Chunk the documents into clauses
     logger.info(f"Parsing clauses from documents...")
     nodes = ClauseNodeParser(
-        min_clause_chars=args.min_clause_chars,
-        max_clause_chars=args.max_clause_chars,
+        model_name="Qwen/Qwen3-4B-Instruct-2507",
     ).get_nodes_from_documents(documents, show_progress=True)
 
     # Persist the index
     logger.info(f"Building and persisting the index to {args.index_dir}...")
     index = VectorStoreIndex(nodes, show_progress=True)
-    index.storage_context.persist(persist_dir=args.index_dir)
+    # index.storage_context.persist(persist_dir=args.index_dir)
 
     # Retrieve for a question, printing the clauses without asking an LLM
     if args.question:
