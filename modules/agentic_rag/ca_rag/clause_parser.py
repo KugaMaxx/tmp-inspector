@@ -174,50 +174,74 @@ def _head_text(block: Dict[str, Any], doc_code: Optional[str]) -> Tuple[str, int
     for depth, pattern in enumerate(profile.patterns[:4], start=1):
         if pattern.match(text):
             return text, depth
-        
+
     return text, -1
+
+
+def _head_label(text: str, doc_code: Optional[str]) -> str:
+    """The bare label of a heading, in the form of ``local_cites``.
+
+    "Clause B6.1 Single staircase" -> "B6.1", "Part C" -> "C", "第 4 章" -> "4".
+    """
+    for pattern in _profile(doc_code).patterns:
+        match = pattern.match(text)
+        if match:
+            words = match.group(0).replace("第", " ").strip(" 章节篇条").split()
+            return words[-1] if words else ""
+    return ""
 
 
 # --- LLM Extraction -----------------------------------------------------------
 
 
-DEFAULT_SYSTEM_PROMPT = """You are an expert in extracting structured data from regulations and codes.
-Your task is to analyze the provided clause text and return exactly ONE valid JSON object. 
+DEFAULT_SYSTEM_PROMPT = """
+You are an expert in extracting structured data from regulations and codes.
+Your task is to analyze the provided clause text and return exactly ONE valid JSON object.
 Do NOT use Markdown formatting (no ```json fences), and do NOT include any explanatory text.
 
 The JSON object must have exactly these three keys:
 {
     "topic": "A concise, one-sentence summary of the clause's main subject.",
-    "cites": ["List of every cited clause, standard, or document identifier"]
+    "local_cites": ["Labels of the clauses of the current document cited by the text"],
+    "external_cites": ["Identifiers of the other documents cited by the text"]
 }
 
-### Examples:
-### Examples of cited identifiers:
-- "BS EN 12101-1:2005 Smoke and heat control systems - Specification for smoke barriers"
-- "ISO 7240-14:2013"
-- "BS ISO 10294-1:1996, Fire-resistance tests"
-- "Cap 572 Fire Safety (Buildings) Ordinance" / "Buildings Ordinance (Cap.123)" / Cap.95F
-- "GB 55036-2023 消防设施通用规范"
- 
-- "Clause 4.2.1"
-- "Section 5"
-- "Subsection 3.1.2"
-- "Part C"
-- "Annex A"
-- "Diagram 2"
-- "第 4.2 条"
+The identifier of the current document is given before the clause text. Sort every citation by these rules:
+
+1. local_cites: a clause, subsection, section or part cited without naming another document, or naming the current document ("this Code", "this Ordinance", its identifier).
+   Write only its label, dropping words such as Clause, Paragraph, Subsection, Section, Part, Regulation, Article, 第, 条, 章, 节:
+   - "Clause B6.1" -> "B6.1"
+   - "Subsection B6" -> "B6"
+   - "Section 5 of this Code" -> "5"
+   - "Part C" -> "C"
+   - "paragraphs 4.2.1 and 4.2.2" -> "4.2.1", "4.2.2"
+   - "第 4.2 条" -> "4.2"
+2. external_cites: another standard, code, ordinance or regulation.
+   Write only its identifier, keeping the part number and the year exactly as printed, and dropping its title and any clause of it:
+   - "BS EN ISO 1182:2010, Reaction to fire tests for products – Non-combustibility test" -> "BS EN ISO 1182:2010"
+   - "BS EN 12101-1:2005 Smoke and heat control systems" -> "BS EN 12101-1:2005"
+   - "Clause 5 of BS 5588-1:1990" -> "BS 5588-1:1990"
+   - "ISO 7240-14" -> "ISO 7240-14"
+   - "GB 55036-2023 消防设施通用规范" -> "GB 55036-2023"
+3. A Hong Kong ordinance or regulation is written as "Cap" and its chapter number, however the text spells it:
+   - "Buildings Ordinance (Cap.123)" -> "Cap 123"
+   - "Cap. 95F" -> "Cap 95F"
+   - "Fire Safety (Buildings) Ordinance, Cap 572" -> "Cap 572"
+4. Leave out tables, figures, diagrams, annexes and the clause itself. List each citation once; use an empty list when there is none.
 """
 
 DEFAULT_USER_PROMPT = """
 Clause text:
 {content}
 
-Extract every cited clause, standard, or document identifier into cites."""
+Extract the topic, the local_cites and the external_cites.
+"""
 
 
 class ClauseExtraction(BaseModel):
     topic: str = ""
-    cites: list[str] = Field(default_factory=list)
+    local_cites: list[str] = Field(default_factory=list)
+    external_cites: list[str] = Field(default_factory=list)
 
 
 def _extract_clause(
@@ -257,7 +281,7 @@ class ClauseNodeParser(NodeParser):
     """
     Split regulatory documents into one node per normative clause.
 
-    Every node carries ``Topic``, ``Hier`` and ``cites`` in
+    Every node carries ``topic``, ``hier``, ``labels``, ``local_cites`` and ``external_cites`` in
     its metadata; only clause content is embedded and returned to the LLM.
     """
 
@@ -340,6 +364,8 @@ class ClauseNodeParser(NodeParser):
         doc_code = str(doc.metadata.get("code") or "").strip()
 
         hier: List[Tuple[int, str]] = [(0, doc_code)] if doc_code else []
+        # Labels of the open headings, which a clause is cited by
+        head_labels: List[Tuple[int, str]] = []
         clauses: List[Dict[str, Any]] = []
 
         for block in self._blocks(doc):
@@ -373,11 +399,14 @@ class ClauseNodeParser(NodeParser):
                     while hier and hier[-1][0] >= depth:
                         hier.pop()
                     hier.append((depth, text))
+                    head_labels = [(d, l) for d, l in head_labels if d < depth]
+                    head_labels.append((depth, _head_label(text, doc_code)))
 
                     clauses.append(
                         {
                             "head": text,
                             "hier": [label for _, label in hier],
+                            "labels": [label for _, label in head_labels if label],
                             "lines": [text],
                         }
                     )
@@ -405,14 +434,21 @@ class ClauseNodeParser(NodeParser):
 
             # Exttract topic and references with agentic LLM
             extracted = _extract_clause(
-                content, model_pipeline, self.user_prompt, self.system_prompt
+                content,
+                model_pipeline,
+                self.user_prompt,
+                self.system_prompt,
             )
+
+            print(f"{content} \n -> {extracted}\n")
 
             metadata = {
                 "topic": extracted["topic"],
                 "content": content,
                 "hier": " > ".join(clause["hier"]),
-                "cites": extracted["cites"],
+                "labels": clause["labels"],
+                "local_cites": extracted["local_cites"],
+                "external_cites": extracted["external_cites"],
             }
             nodes.append(self._make_node(metadata, doc))
 
@@ -434,10 +470,14 @@ class ClauseNodeParser(NodeParser):
             [
                 "content",
                 "hier",
-                "cites",
+                "labels",
+                "local_cites",
+                "external_cites",
             ]
         )
-        node.excluded_llm_metadata_keys.extend(["cites"])
+        node.excluded_llm_metadata_keys.extend(
+            ["labels", "local_cites", "external_cites"]
+        )
         
         return node
 

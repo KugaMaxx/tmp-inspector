@@ -89,18 +89,6 @@ def parse_args():
         default="text-embedding-3-small",
         help="Embedding model used for the dense half of the retrieval."
     )
-    # parser.add_argument(
-    #     "--api_base",
-    #     type=str,
-    #     default=os.environ.get("OPENAI_API_BASE", "https://aihubmix.com/v1"),
-    #     help="Base URL of an OpenAI-compatible embedding endpoint."
-    # )
-    # parser.add_argument(
-    #     "--api_key",
-    #     type=str,
-    #     default=os.environ.get("OPENAI_API_KEY", ""),
-    #     help="API key of the embedding endpoint. Prefer the OPENAI_API_KEY environment variable."
-    # )
 
     # Query settings
     parser.add_argument(
@@ -116,30 +104,13 @@ def parse_args():
         help="Number of clauses kept after fusing the sparse and dense rankings."
     )
     parser.add_argument(
-        "--no_expand",
-        action="store_true",
-        help="Do not pull in the clauses cited by the retrieved ones."
+        "--max_hops",
+        type=int,
+        default=1,
+        help="Citation hops to follow from the retrieved clauses; 0 disables the expansion."
     )
 
     return parser.parse_args()
-
-
-def print_retrieved(question: str, results) -> None:
-    """Print the clauses as they are stored, so the chunking can be judged."""
-    print(f"\nquestion: {question}\n")
-    if not results:
-        print("no clauses retrieved")
-        return
-
-    for hit in results:
-        kind = "matched" if hit.score else "cited by a match"
-        score = f"{hit.score:.4f}" if hit.score else "-"
-        print(f"[{kind}]  score={score}")
-        print(f"  topic: {hit.node.metadata['topic']}")
-        print(f"  hier : {hit.node.metadata['hier']}")
-        print(f"  local_ref : {hit.node.metadata.get('local_ref', [])}")
-        print(f"  global_ref: {hit.node.metadata.get('global_ref', [])}")
-        print(f"  {hit.node.get_content(metadata_mode='none')[:300]}...\n")
 
 
 def main():
@@ -192,7 +163,20 @@ def main():
         retriever = ClauseAwareRetriever(
             index, nodes, similarity_top_k=args.top_k, expand=not args.no_expand
         )
-        print_retrieved(args.question, retriever.retrieve(args.question))
+        results = retriever.retrieve(args.question)
+
+        # Print the retrieved clauses
+        print(f"\nquestion: {args.question}\n")
+        for hit in results:
+            meta = hit.node.metadata
+            print(f"[hop {meta['hop']} | {meta['relation']}]  score={hit.score or 0.0:.4f}")
+            if meta["via"]:
+                print(f"  via  : {meta['via']}")
+            print(f"  topic: {meta['topic']}")
+            print(f"  hier : {meta['hier']}")
+            print(f"  local_cites   : {meta.get('local_cites', [])}")
+            print(f"  external_cites: {meta.get('external_cites', [])}")
+            print(f"  content: {meta['content'][:300]}...\n")
 
 
 if __name__ == "__main__":
