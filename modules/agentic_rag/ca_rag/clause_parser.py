@@ -1,18 +1,3 @@
-"""Clause-aware chunking of fire safety codes and regulations.
-
-A regulatory document is split so that one node holds exactly one independent
-normative clause, described by the tuple <ID, Topic, Hier, Content, Ref>.
-Numbering styles of EU/UK codes (``Clause 4.2.1``, ``Regulation 12``), Chinese
-codes (``4.2.1``, ``第 4.2.1 条``) and Hong Kong ordinances (``6. Heading``)
-are all recognised.
-
-The input is the block list of a MinerU parse, not raw text: MinerU already
-labels every block with its role on the page, so page numbers, running headers
-and contents entries arrive pre-separated and do not have to be guessed from
-their shape. What MinerU does not provide is meaning -- the hierarchy depth of a
-heading and the cross-references inside a clause are still derived here.
-"""
-
 from __future__ import annotations
 
 import re
@@ -172,13 +157,13 @@ def _table_text(block: Dict[str, Any], doc_code: Optional[str]) -> Tuple[str, in
     parts.extend(row for row in rows if row)
     
     text = " ".join(part for part in parts if part)
-    return text, 0
+    return text, -1
 
 
 def _main_text(block: Dict[str, Any], doc_code: Optional[str]) -> Tuple[str, int]:
     """Process the main text of a block."""
     text = " ".join(str(block.get("content") or "").split())
-    return text, 0
+    return text, -1
 
 
 def _head_text(block: Dict[str, Any], doc_code: Optional[str]) -> Tuple[str, int]:
@@ -190,27 +175,10 @@ def _head_text(block: Dict[str, Any], doc_code: Optional[str]) -> Tuple[str, int
         if pattern.match(text):
             return text, depth
         
-    return text, 0
+    return text, -1
 
 
 # --- LLM Extraction -----------------------------------------------------------
-
-_MODEL_PIPELINES: Dict[str, Any] = {}
-
-
-def _get_model_pipeline(model_name: str) -> Any:
-    """Load one text-generation pipeline per model name and reuse it globally."""
-    if model_name not in _MODEL_PIPELINES:
-        from transformers import pipeline
-
-        _MODEL_PIPELINES[model_name] = pipeline(
-            "text-generation",
-            model=model_name,
-            device_map="auto",
-            max_length=None,
-        )
-        
-    return _MODEL_PIPELINES[model_name]
 
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert in extracting structured data from regulations and codes.
@@ -220,18 +188,17 @@ Do NOT use Markdown formatting (no ```json fences), and do NOT include any expla
 The JSON object must have exactly these three keys:
 {
     "topic": "A concise, one-sentence summary of the clause's main subject.",
-    "local_ref": ["List of clause identifiers that belong to the SAME document"],
-    "global_ref": ["List of identifiers that belong to EXTERNAL standards or other documents"]
+    "cites": ["List of every cited clause, standard, or document identifier"]
 }
 
 ### Examples:
-1. GLOBAL REFERENCE (`global_ref`):
+### Examples of cited identifiers:
 - "BS EN 12101-1:2005 Smoke and heat control systems - Specification for smoke barriers"
 - "ISO 7240-14:2013"
 - "BS ISO 10294-1:1996, Fire-resistance tests"
 - "Cap 572 Fire Safety (Buildings) Ordinance" / "Buildings Ordinance (Cap.123)" / Cap.95F
 - "GB 55036-2023 消防设施通用规范"
-2. LOCAL REFERENCE (`local_ref`):
+ 
 - "Clause 4.2.1"
 - "Section 5"
 - "Subsection 3.1.2"
@@ -245,25 +212,21 @@ DEFAULT_USER_PROMPT = """
 Clause text:
 {content}
 
-Extract the topic and classify every cited reference as local_ref or global_ref."""
+Extract every cited clause, standard, or document identifier into cites."""
 
 
 class ClauseExtraction(BaseModel):
     topic: str = ""
-    local_ref: list[str] = Field(default_factory=list)
-    global_ref: list[str] = Field(default_factory=list)
+    cites: list[str] = Field(default_factory=list)
 
 
 def _extract_clause(
     content: str,
-    model_name: Optional[str],
+    model_pipeline: Any,
     user_prompt: str,
     system_prompt: str,
 ) -> Dict[str, Any]:
     """Extract topic and references with the configured local model."""
-
-    # Lazy load the model pipeline
-    model_pipeline = _get_model_pipeline(model_name)
 
     # Prepare the messages for the LLM
     messages = [
@@ -280,8 +243,6 @@ def _extract_clause(
     )
     raw = gen_text[0].get("generated_text", "")
 
-    print(f"{content} -> {raw}")
-
     try:
         result = ClauseExtraction.model_validate(json.loads(raw))
     except Exception as e:
@@ -296,7 +257,7 @@ class ClauseNodeParser(NodeParser):
     """
     Split regulatory documents into one node per normative clause.
 
-    Every node carries ``Topic``, ``Hier``, ``local_ref`` and ``global_ref`` in
+    Every node carries ``Topic``, ``Hier`` and ``cites`` in
     its metadata; only clause content is embedded and returned to the LLM.
     """
 
@@ -338,11 +299,27 @@ class ClauseNodeParser(NodeParser):
     ) -> List[BaseNode]:
         all_nodes: List[BaseNode] = []
         nodes_with_progress = get_tqdm_iterable(nodes, show_progress, "Parsing nodes")
-        
-        for node in nodes_with_progress:
-            all_nodes.extend(self._parse_document(node))
-        
-        return all_nodes
+
+        # Initialize the model pipeline for clause extraction
+        from transformers import pipeline
+        model_pipeline = pipeline(
+            "text-generation",
+            model=self.model_name,
+            device_map="auto",
+            max_length=None,
+        )
+
+        # Parse each document into clauses and build nodes
+        try:
+            for node in nodes_with_progress:
+                all_nodes.extend(self._parse_document(node, model_pipeline))
+            return all_nodes
+
+        # Release pipeline resources and clear GPU memory after processing
+        finally:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @staticmethod
     def _blocks(doc: BaseNode) -> Iterable[Dict[str, Any]]:
@@ -358,11 +335,11 @@ class ClauseNodeParser(NodeParser):
         # Multi-page documents
         return [block for page in pages for block in page.get("blocks", [])]
 
-    def _parse_document(self, doc: BaseNode) -> List[BaseNode]:
+    def _parse_document(self, doc: BaseNode, model_pipeline: Any) -> List[BaseNode]:
         """Parse a single document into one node per clause."""
-        doc_code = doc.metadata.get("code")
+        doc_code = str(doc.metadata.get("code") or "").strip()
 
-        hier: List[Tuple[int, str]] = []
+        hier: List[Tuple[int, str]] = [(0, doc_code)] if doc_code else []
         clauses: List[Dict[str, Any]] = []
 
         for block in self._blocks(doc):
@@ -409,10 +386,13 @@ class ClauseNodeParser(NodeParser):
                         clauses[-1]["lines"].append(text)
                 continue
 
-        return self._build_nodes(clauses, doc, doc_code)
+        return self._build_nodes(clauses, doc, model_pipeline)
 
     def _build_nodes(
-        self, clauses: List[Dict[str, Any]], doc: BaseNode, doc_code: str
+        self,
+        clauses: List[Dict[str, Any]],
+        doc: BaseNode,
+        model_pipeline: Any,
     ) -> List[BaseNode]:
         """Build nodes from the parsed clauses."""
         # Build a node for each clause
@@ -425,31 +405,39 @@ class ClauseNodeParser(NodeParser):
 
             # Exttract topic and references with agentic LLM
             extracted = _extract_clause(
-                content, self.model_name, self.user_prompt, self.system_prompt
+                content, model_pipeline, self.user_prompt, self.system_prompt
             )
 
             metadata = {
                 "topic": extracted["topic"],
-                "hier": " > ".join([doc_code, *clause["hier"]]),
-                "local_ref": extracted["local_ref"],
-                "global_ref": extracted["global_ref"],
+                "content": content,
+                "hier": " > ".join(clause["hier"]),
+                "cites": extracted["cites"],
             }
-            nodes.append(self._make_node(content, metadata, doc))
+            nodes.append(self._make_node(metadata, doc))
 
         return nodes
 
     def _make_node(
-        self, content: str, metadata: Dict[str, Any], doc: BaseNode
+        self, metadata: Dict[str, Any], doc: BaseNode
     ) -> TextNode:
         """Make a node from the clause content and metadata."""
         
-        # Make the node with the content and metadata
-        node = build_nodes_from_splits([content[:12000]], doc, id_func=self.id_func)[0]
+        # Make the node
+        topic = str(metadata.get("topic") or "").strip()
+        node = build_nodes_from_splits([topic], doc, id_func=self.id_func)[0]
         node.metadata.update(metadata)
+        node.metadata.pop("mineru_pages", None)
 
-        # Reference lists are bookkeeping.
-        node.excluded_embed_metadata_keys.extend(["local_ref", "global_ref"])
-        node.excluded_llm_metadata_keys.extend(["local_ref", "global_ref"])
+        # Only topic should contribute to the embedding
+        node.excluded_embed_metadata_keys.extend(
+            [
+                "content",
+                "hier",
+                "cites",
+            ]
+        )
+        node.excluded_llm_metadata_keys.extend(["cites"])
         
         return node
 
