@@ -1,28 +1,17 @@
 from __future__ import annotations
 
-import os
-import sys
 import logging
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import List, Tuple
 
 from llama_index.core import (
     Settings,
-    StorageContext,
     VectorStoreIndex,
-    load_index_from_storage,
 )
-from llama_index.core.schema import BaseNode
-from llama_index.embeddings.openai import OpenAIEmbedding
-from llama_index.core import SimpleDirectoryReader
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# Allow this file to be launched directly as well as with ``python -m``.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from modules.agentic_rag.ca_rag import (
+from tmp_inspector.ca_rag import (
     ClauseNodeParser,
     MineruDirectoryReader,
     ClauseAwareRetriever,
@@ -37,7 +26,7 @@ def parse_args():
     parser.add_argument(
         "--corpus_dir",
         type=str,
-        default="/home/dszh/workspace/tmp-inspector/data/RAG/CoP",
+        default="/home/dszh/workspace/tmp-inspector/data/RAG/test",
         help="Directory containing the corpus files."
     )
     parser.add_argument(
@@ -160,9 +149,7 @@ def main():
 
     # Retrieve for a question, printing the clauses without asking an LLM
     if args.question:
-        retriever = ClauseAwareRetriever(
-            index, nodes, similarity_top_k=args.top_k, expand=not args.no_expand
-        )
+        retriever = ClauseAwareRetriever(index, nodes, similarity_top_k=args.top_k)
         results = retriever.retrieve(args.question)
 
         # Print the retrieved clauses
