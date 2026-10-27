@@ -11,7 +11,7 @@ from llama_index.core import (
 )
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from tmp_inspector.ca_rag import (
+from tmp_inspector.rag.modules.ca_rag import (
     ClauseNodeParser,
     MineruDirectoryReader,
     ClauseAwareRetriever,
