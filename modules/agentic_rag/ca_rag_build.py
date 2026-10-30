@@ -156,13 +156,12 @@ def main():
         print(f"\nquestion: {args.question}\n")
         for hit in results:
             meta = hit.node.metadata
-            print(f"[hop {meta['hop']} | {meta['relation']}]  score={hit.score or 0.0:.4f}")
+            print(f"[hop {meta['hop']}]  score={hit.score or 0.0:.4f}")
             if meta["via"]:
                 print(f"  via  : {meta['via']}")
             print(f"  topic: {meta['topic']}")
             print(f"  hier : {meta['hier']}")
-            print(f"  local_cites   : {meta.get('local_cites', [])}")
-            print(f"  external_cites: {meta.get('external_cites', [])}")
+            print(f"  cites: {meta.get('cites', [])}")
             print(f"  content: {meta['content'][:300]}...\n")
 
 
