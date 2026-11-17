@@ -2,13 +2,21 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from llama_index.core import VectorStoreIndex
+from llama_index.core import (
+    StorageContext,
+    VectorStoreIndex,
+    load_index_from_storage,
+)
 from llama_index.core.retrievers import BaseRetriever
 from llama_index.core.storage.docstore import SimpleDocumentStore
 
-from tmp_inspector.rag.modules.ca_rag import ClauseAwareRetriever, ClauseNodeParser, MineruDirectoryReader
+from tmp_inspector.rag.modules.ca_rag import (
+    ClauseAwareRetriever,
+    ClauseNodeParser,
+    MineruDirectoryReader,
+)
 
-from .base import load_or_build_index, register
+from .base import register
 
 logger = logging.getLogger(__name__)
 
@@ -27,39 +35,49 @@ def build_carag(
     max_cites_per_node: int = 3,
     tier: str = "advanced",
 ) -> BaseRetriever:
-    """Clause-aware hybrid retrieval with citation expansion, over MinerU documents.
+    """Clause-aware hybrid retrieval with citation expansion"""
 
-    ``seed_k`` clauses come from the first round, ``top_k`` when unset. Cited
-    clauses inherit ``hop_decay`` of their parent's score per hop and are
-    ranked together with them. MinerU reads ``input_dir`` only when neither the
-    index nor the clause nodes are cached, with the pages to skip from
-    ``corpus_csv`` and its layout cached to ``mineru_cache_dir``.
-    """
+    # Initialize index directory
+    index_dir.mkdir(parents=True, exist_ok=True)
     nodes_path = index_dir / "clause_nodes.json"
 
-    def build():
+    try:
+        # Load existing index from storage
+        index = load_index_from_storage(
+            StorageContext.from_defaults(persist_dir=str(index_dir)),
+        )
+    except FileNotFoundError:
         if nodes_path.exists():
             # Parsing calls an LLM per clause, so its nodes are cached apart from the index
             logger.info(f"Loading clause nodes from {nodes_path}")
             nodes = list(SimpleDocumentStore.from_persist_path(str(nodes_path)).docs.values())
         else:
+            # Read documents from the input directory
             documents = MineruDirectoryReader(
                 input_dir=str(input_dir),
                 corpus_csv=str(corpus_csv) if corpus_csv else None,
                 cache_dir=str(mineru_cache_dir) if mineru_cache_dir else None,
                 tier=tier,
             ).load_data()
-            nodes = ClauseNodeParser(model_name=parse_model).get_nodes_from_documents(documents, show_progress=True)
+
+            # Parse the documents into clause nodes
+            nodes = ClauseNodeParser(
+                model_name=parse_model,
+            ).get_nodes_from_documents(documents, show_progress=True)
+            
+            # Create a document store for the clause nodes and persist it
             store = SimpleDocumentStore()
             store.add_documents(nodes)
             store.persist(persist_path=str(nodes_path))
-        return VectorStoreIndex(nodes, show_progress=True)
 
-    index = load_or_build_index(index_dir, build)
-    # The persisted index docstore already holds the clause nodes
+        index = VectorStoreIndex(nodes, show_progress=True)
+        index.storage_context.persist(str(index_dir))
+
     nodes = list(index.storage_context.docstore.docs.values())
+
     return ClauseAwareRetriever(
-        index, nodes,
+        index,
+        nodes,
         similarity_top_k=seed_k or top_k,
         max_hops=max_hops,
         hop_decay=hop_decay,

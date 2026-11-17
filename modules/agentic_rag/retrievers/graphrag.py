@@ -1,6 +1,13 @@
 import logging
 from pathlib import Path
-from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
+
+from llama_index.core import (
+    Settings,
+    SimpleDirectoryReader,
+    StorageContext,
+    VectorStoreIndex,
+    load_index_from_storage,
+)
 from llama_index.core.indices.property_graph import (
     LLMSynonymRetriever,
     PropertyGraphIndex,
@@ -9,25 +16,13 @@ from llama_index.core.indices.property_graph import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import BaseRetriever
-from llama_index.core.schema import TextNode
 
-from .base import load_or_build_index, register
+from .base import register
 
 logger = logging.getLogger(__name__)
 
 
 class HybridGraphRAGRetriever(BaseRetriever):
-    """Chunk-level dense retrieval as the primary signal, graph sub-retrievers as
-    augmentation.
-
-    PropertyGraphIndex.as_retriever concatenates sub-retriever results and ranks
-    them by raw sub-retriever score. Entity cosine scores are not comparable to
-    chunk-cosine scores, and the graph legs often push irrelevant chunks (whose
-    entity names happen to match the query) above the right chunks. Here we
-    run the two groups separately, min-max normalise within each group, give
-    chunk hits a configurable weight, and merge by source chunk id.
-    """
-
     def __init__(
         self,
         chunk_retriever: BaseRetriever,
@@ -53,14 +48,12 @@ class HybridGraphRAGRetriever(BaseRetriever):
         return hits
 
     def _retrieve(self, query_bundle):
+        # Retrieve from both chunk-level and graph-level retrievers
         pool_k = max(self._top_k * 2, 20)
         chunk_hits = list(self._chunk_retriever.retrieve(query_bundle))[:pool_k]
-        try:
-            graph_hits = list(self._graph_retriever.retrieve(query_bundle))[:pool_k]
-        except Exception as exc:
-            logger.warning(f"graph sub-retrievers failed: {exc}")
-            graph_hits = []
+        graph_hits = list(self._graph_retriever.retrieve(query_bundle))[:pool_k]
 
+        # Score normalization and weighted sum
         self._norm(chunk_hits)
         self._norm(graph_hits)
         for h in chunk_hits:
@@ -68,6 +61,7 @@ class HybridGraphRAGRetriever(BaseRetriever):
         for h in graph_hits:
             h.score = (h.score or 0.0) * (1.0 - self._chunk_weight)
 
+        # Merge hits by node_id, keeping the best score for each node
         best = {}
         for h in chunk_hits + graph_hits:
             key = h.node.node_id
@@ -87,31 +81,62 @@ def build_graphrag(
     max_paths: int = 10,
     chunk_weight: float = 0.7,
 ) -> BaseRetriever:
-    """Hybrid GraphRAG: chunk-level dense retrieval merged with the graph
-    sub-retrievers of a PropertyGraphIndex."""
-    index = load_or_build_index(
-        index_dir,
-        lambda: PropertyGraphIndex.from_documents(
-            SimpleDirectoryReader(input_dir=str(input_dir), required_exts=[".pdf"], recursive=True).load_data(),
+    """Hybrid Graph RAG: combines a graph-based retriever with a chunk-based retriever, allowing for both structured and unstructured retrieval."""
+    
+    # Initialize index directory
+    graph_index_dir = index_dir / "graph"
+    chunk_index_dir = index_dir / "chunk"
+    graph_index_dir.mkdir(parents=True, exist_ok=True)
+    chunk_index_dir.mkdir(parents=True, exist_ok=True)
+
+    # Graph-level index and retriever
+    try:
+        # Load existing index from storage
+        graph_index = load_index_from_storage(
+            StorageContext.from_defaults(persist_dir=str(graph_index_dir)),
             llm=Settings.llm,
             embed_model=Settings.embed_model,
-            kg_extractors=[SimpleLLMPathExtractor(llm=Settings.llm, max_paths_per_chunk=max_paths)],
-            transformations=[SentenceSplitter(chunk_size=chunk_size, chunk_overlap=0)],
+        )
+    except FileNotFoundError:
+        # Read documents from the input directory
+        documents = SimpleDirectoryReader(
+            input_dir=str(input_dir),
+            required_exts=[".pdf"],
+            recursive=True,
+        ).load_data()
+        
+        # Create a property graph index with LLM-based path extraction
+        graph_index = PropertyGraphIndex.from_documents(
+            documents,
+            llm=Settings.llm,
+            embed_model=Settings.embed_model,
+            kg_extractors=[
+                SimpleLLMPathExtractor(
+                    llm=Settings.llm,
+                    max_paths_per_chunk=max_paths,
+                ),
+            ],
+            transformations=[
+                SentenceSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=0,
+                ),
+            ],
             show_progress=True,
-        ),
-        llm=Settings.llm,
-        embed_model=Settings.embed_model,
-    )
-    # SimplePropertyGraphStore does not support vector queries itself; the entity
-    # embeddings live in the index's companion vector store, so wire it into
-    # VectorContextRetriever explicitly, otherwise it silently returns zero hits.
-    graph_store = index.property_graph_store
-    graph_retriever = index.as_retriever(
+        )
+        graph_index.storage_context.persist(str(graph_index_dir))
+
+    graph_store = graph_index.property_graph_store
+    graph_retriever = graph_index.as_retriever(
         sub_retrievers=[
-            LLMSynonymRetriever(graph_store, llm=llm, include_text=True),
+            LLMSynonymRetriever(
+                graph_store,
+                llm=Settings.llm,
+                include_text=True,
+            ),
             VectorContextRetriever(
                 graph_store,
-                vector_store=index.vector_store,
+                vector_store=graph_index.vector_store,
                 embed_model=Settings.embed_model,
                 include_text=True,
                 similarity_top_k=top_k,
@@ -119,14 +144,35 @@ def build_graphrag(
         ],
     )
 
-    # Chunk-level dense retriever over the same source chunks the graph was
-    # built on (persisted in the docstore). Cached beside the graph index.
-    source_chunks = [n for n in index.storage_context.docstore.docs.values() if isinstance(n, TextNode)]
-    chunk_index = load_or_build_index(
-        index_dir / "_chunk_vector",
-        lambda: VectorStoreIndex(source_chunks, embed_model=Settings.embed_model, show_progress=True),
-        embed_model=Settings.embed_model,
-    )
+    # Chunk-level index and retriever
+    try:
+        chunk_index = load_index_from_storage(
+            StorageContext.from_defaults(persist_dir=str(chunk_index_dir)),
+            embed_model=Settings.embed_model,
+        )
+    except FileNotFoundError:
+        # Read documents from the input directory
+        documents = SimpleDirectoryReader(
+            input_dir=str(input_dir),
+            required_exts=[".pdf"],
+            recursive=True,
+        ).load_data()
+        
+        # Split documents into chunks
+        splitter = SentenceSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=0,
+        )
+
+        # Create a vector store index
+        chunk_index = VectorStoreIndex.from_documents(
+            documents,
+            transformations=[splitter],
+            embed_model=Settings.embed_model,
+            show_progress=True,
+        )
+        chunk_index.storage_context.persist(str(chunk_index_dir))
+
     chunk_retriever = chunk_index.as_retriever(similarity_top_k=top_k)
 
     return HybridGraphRAGRetriever(
