@@ -19,8 +19,8 @@ def build_hyde(
     input_dir: Path,
     index_dir: Path,
     top_k: int,
-    chunk_size: int = 256,
-    chunk_overlap: int = 32,
+    chunk_size: int = 1024,
+    chunk_overlap: int = 20,
 ) -> BaseRetriever:
     """HyDE: hybrid retrieval with document expansion using LLMs"""
 

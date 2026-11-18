@@ -7,11 +7,24 @@ from datetime import datetime
 from tqdm import tqdm
 
 from llama_index.core import Settings
+from llama_index.core.prompts import PromptTemplate
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 from retrievers import REGISTRY
 from tmp_inspector.rag.metrics import GenerationMetrics, RetrievalMetrics
+
+
+ANSWER_PROMPT = PromptTemplate(
+    "Answer the question using only the regulation excerpts below. "
+    "Answer concisely in one to three sentences. If the excerpts do not contain "
+    "the answer, say that the answer is not found.\n"
+    "---------------------\n"
+    "{context}\n"
+    "---------------------\n"
+    "Question: {query}\n"
+    "Answer: "
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,25 +58,25 @@ def parse_args():
     parser.add_argument(
         "--corpus_dir",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/data/RAG",
+        required=True,
         help="Read documents recursively in every subdirectory",
     )
     parser.add_argument(
         "--corpus_csv",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/configs/corpus.csv",
+        required=True,
         help="CSV file that store the basic information about the documents.",
     )
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/cache",
+        required=True,
         help="Cached embeddings and retrieval index will be loaded if provided.",
     )
     parser.add_argument(
-        "--work_dir",
+        "--output_dir",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/eval",
+        default="./eval",
         help="Logs, answers and result tables. Cached answers are reused on rerun.",
     )
 
@@ -71,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--systems",
         nargs="+",
-        default=["fixed"],
+        default=sorted(REGISTRY),
         choices=sorted(REGISTRY),
     )
     parser.add_argument(
@@ -83,7 +96,7 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda:1",
+        default="cuda",
         help="Device to use for training (e.g., 'cuda' or 'cpu')"
     )
 
@@ -91,7 +104,7 @@ def parse_args():
     parser.add_argument(
         "--qa_path",
         type=str,
-        default="/home/23132798r/workspace/tmp-inspector/data/RAG/test_questions.json",
+        required=True,
         help="JSON array of {question, answer, evidence: [{source, text}], comments}. "
         "Synthesised from the plain text when the file is absent.",
     )
@@ -118,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--llm_model",
         type=str,
-        default="qwen3-max",
+        default="qwen3-8b",
         help="LLM model used for retrieval and generation.",
     )
     parser.add_argument(
@@ -139,6 +152,18 @@ def parse_args():
         action="store_true",
         help="Score retrieval only.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Sampling seed forwarded to vLLM for reproducibility.",
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=512,
+        help="Max new tokens for the answering LLM.",
+    )
 
     return parser.parse_args()
 
@@ -146,8 +171,8 @@ def parse_args():
 def main():
     # Parse arguments
     args = parse_args()
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set logging
     logging.basicConfig(
@@ -155,7 +180,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[
-            logging.FileHandler(work_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.FileHandler(output_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
             logging.StreamHandler()
         ],
     )
@@ -169,13 +194,19 @@ def main():
         trust_remote_code=True
     )
     Settings.llm = OpenAILike(
-        model=args.llm_model, 
-        api_base=args.api_base, 
-        api_key=args.api_key, 
+        model=args.llm_model,
+        api_base=args.api_base,
+        api_key=args.api_key,
         is_chat_model=True,
+        temperature=0.0,
+        max_tokens=args.max_tokens,
         additional_kwargs={
+            "seed": args.seed,
+            "top_p": 1.0,
             "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False}
+                "top_k": 1,
+                "repetition_penalty": 1.0,
+                "chat_template_kwargs": {"enable_thinking": False},
             }
         }
     )
@@ -188,24 +219,38 @@ def main():
     logger.info("Building RAG systems...")
     systems = build_systems(args)
 
-    # Evaluate retrieval
-    logger.info("Evaluating retrieval...")
-    metrics = RetrievalMetrics()
+    # Evaluate retrieval and (optionally) generation in a single pass
+    logger.info(f"Evaluating retrieval...")
+    metrics_ret = RetrievalMetrics()
+    metrics_gen = GenerationMetrics()
     for name, retriever in systems.items():
-        metrics.reset()
+        metrics_ret.reset()
+        metrics_gen.reset()
         for item in tqdm(items, desc=f"Evaluating {name}"):
             hits = retriever.retrieve(item["question"])
-            hits = hits[:args.retrieval_k]
+            retrieval_hits = hits[:args.retrieval_k]
 
             print("question:\n", item["question"])
             print("ground truth:\n", "\n".join(item["gold"]))
-            print("hits:\n", "\n".join([hit.node.get_content().replace("\\n", " ").replace("\r\n", " ").replace("\n", " ") for hit in hits]))
+            print("hits:\n", "\n".join([hit.node.get_content().replace("\\n", " ").replace("\r\n", " ").replace("\n", " ") for hit in retrieval_hits]))
 
-            scores = metrics.update([hit.node.get_content() for hit in hits], item["gold"])
-            print("scores:\n", scores)
+            scores = metrics_ret.update([hit.node.get_content() for hit in retrieval_hits], item["gold"])
+            print("retrieval scores:\n", scores)
+
+            if metrics_gen is not None and (item.get("answer") or "").strip():
+                context = "\n\n".join(hit.node.get_content() for hit in hits[:args.generation_k])
+                prompt = ANSWER_PROMPT.format(query=item["question"], context=context)
+                prediction = str(Settings.llm.complete(prompt)).strip()
+                print("answer:\n", item["answer"])
+                print("prediction:\n", prediction)
+                scores = metrics_gen.update(prediction, item["answer"])
+                print("generation scores:\n", scores)
+
             print('============================================')
 
-        logger.info(f"\nRAG System: {name}\n {metrics.summarize()}")
+        logger.info(f"\nRAG System: {name}\n Retrieval:\n {metrics_ret.summarize()}")
+        if metrics_gen is not None:
+            logger.info(f" Generation (w. {args.llm_model}):\n {metrics_gen.summarize()}")
 
 
 if __name__ == "__main__":
